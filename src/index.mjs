@@ -50,9 +50,13 @@ if (process.env.MAIL_ENV_FILE) {
 }
 
 const CFG = {
-  email: process.env.MAIL_EMAIL,
+  email: process.env.MAIL_EMAIL, // login / authenticated account
   pass: process.env.MAIL_PASSWORD,
   fromName: process.env.MAIL_FROM_NAME || "",
+  // From address on outgoing mail; defaults to the login address. Set to a
+  // verified alias (e.g. sam@…) to send as that identity while still
+  // authenticating as MAIL_EMAIL.
+  fromAddress: process.env.MAIL_FROM_ADDRESS || process.env.MAIL_EMAIL,
   imapHost: process.env.MAIL_IMAP_HOST || "imap.zoho.com",
   imapPort: Number(process.env.MAIL_IMAP_PORT || 993),
   smtpHost: process.env.MAIL_SMTP_HOST || "smtp.zoho.com",
@@ -117,6 +121,10 @@ server.registerTool(
     });
     await new Promise((res, rej) => smtpTransport().verify((e) => (e ? rej(e) : res())));
     out.push(`SMTP OK — ${CFG.smtpHost}:${CFG.smtpPort}`);
+    out.push(
+      `Sending as: ${CFG.fromAddress}` +
+        (CFG.fromAddress !== CFG.email ? ` (alias; auth as ${CFG.email})` : "")
+    );
     out.push(`Config source: ${configSource}`);
     out.push(`Dry-run: ${CFG.dryRun ? "ON — send_email previews only" : "OFF — emails send for real"}`);
     return text(out.join("\n"));
@@ -222,7 +230,7 @@ server.registerTool(
   },
   async ({ to, subject, body, cc, bcc, html }) => {
     assertCreds();
-    const from = CFG.fromName ? `"${CFG.fromName}" <${CFG.email}>` : CFG.email;
+    const from = CFG.fromName ? `"${CFG.fromName}" <${CFG.fromAddress}>` : CFG.fromAddress;
     const preview = [
       `From: ${from}`,
       `To: ${to}`,
