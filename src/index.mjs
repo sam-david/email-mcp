@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // email-mcp — a minimal MCP server for reading and sending email over any
-// IMAP/SMTP account (Zoho, Gmail, Fastmail, custom — set the hosts in .env).
-// Credentials come ONLY from environment / .env — never hard-coded.
+// IMAP/SMTP account (Zoho, Gmail, Fastmail, custom).
+// Credentials come ONLY from the environment or an external profile/env file —
+// never from inside this repo, so one install serves many projects/accounts.
 // Connects ONLY to the configured mail hosts. No telemetry, no other network I/O.
 
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -14,20 +15,38 @@ import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import { simpleParser } from "mailparser";
 
-// ---- tiny .env loader (no dependency); real env vars always win ----
-const __dirname = dirname(fileURLToPath(import.meta.url));
-try {
-  const raw = readFileSync(join(__dirname, "..", ".env"), "utf8");
-  for (const line of raw.split("\n")) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m && !(m[1] in process.env)) {
-      let v = m[2];
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-      process.env[m[1]] = v;
+// ---- credential resolution (no secrets ever live in this repo) ----
+// Load order — the process environment always wins over file values:
+//   1. MAIL_ENV_FILE=/path/to/file  → load that env file
+//   2. MAIL_PROFILE=name            → load ~/.config/email-mcp/<name>.env
+//   3. otherwise                    → rely purely on the process environment
+// Each project registers this server with its own MAIL_PROFILE (or inline -e
+// vars), so per-mailbox credentials stay OUTSIDE this shared server directory.
+function loadEnvFile(path) {
+  try {
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+      if (m && !(m[1] in process.env)) {
+        let v = m[2];
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        process.env[m[1]] = v;
+      }
     }
+    return true;
+  } catch {
+    return false;
   }
-} catch {
-  /* no .env file — rely on the process environment */
+}
+
+const expandHome = (p) => (p.startsWith("~") ? join(homedir(), p.slice(1)) : p);
+
+let configSource = "process environment";
+if (process.env.MAIL_ENV_FILE) {
+  const path = expandHome(process.env.MAIL_ENV_FILE);
+  configSource = loadEnvFile(path) ? path : `${path} (NOT FOUND)`;
+} else if (process.env.MAIL_PROFILE) {
+  const path = join(homedir(), ".config", "email-mcp", `${process.env.MAIL_PROFILE}.env`);
+  configSource = loadEnvFile(path) ? path : `${path} (NOT FOUND)`;
 }
 
 const CFG = {
@@ -43,7 +62,10 @@ const CFG = {
 
 function assertCreds() {
   if (!CFG.email || !CFG.pass) {
-    throw new Error("Missing MAIL_EMAIL or MAIL_PASSWORD — copy .env.example to .env and fill them in.");
+    throw new Error(
+      `Missing MAIL_EMAIL or MAIL_PASSWORD (config source: ${configSource}). ` +
+        "Set MAIL_PROFILE and create ~/.config/email-mcp/<profile>.env, or pass credentials as env vars."
+    );
   }
 }
 
@@ -95,6 +117,7 @@ server.registerTool(
     });
     await new Promise((res, rej) => smtpTransport().verify((e) => (e ? rej(e) : res())));
     out.push(`SMTP OK — ${CFG.smtpHost}:${CFG.smtpPort}`);
+    out.push(`Config source: ${configSource}`);
     out.push(`Dry-run: ${CFG.dryRun ? "ON — send_email previews only" : "OFF — emails send for real"}`);
     return text(out.join("\n"));
   }
