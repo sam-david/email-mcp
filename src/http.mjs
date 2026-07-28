@@ -108,9 +108,11 @@ export function startHttp() {
     }
   });
 
-  httpServer.listen(PORT, () => {
-    console.error(
-      `email-mcp HTTP on :${PORT} — ${multi ? "MULTI-TENANT (path → profile → Secrets Manager)" : "single mode"}`
+  // Bind 0.0.0.0 explicitly (IPv4) so container health checks reach it, and log
+  // to stdout so platform log capture sees it.
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(
+      `email-mcp HTTP on 0.0.0.0:${PORT} — ${multi ? "MULTI-TENANT (path → profile → Secrets Manager)" : "single mode"}`
     );
   });
 

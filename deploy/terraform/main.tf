@@ -102,6 +102,13 @@ resource "aws_iam_role_policy" "read_secrets" {
 resource "aws_apprunner_service" "app" {
   service_name = var.service_name
 
+  # Ensure the access role can actually pull from ECR (and the instance role can
+  # read secrets) BEFORE the service tries to deploy.
+  depends_on = [
+    aws_iam_role_policy_attachment.ecr_access,
+    aws_iam_role_policy.read_secrets,
+  ]
+
   source_configuration {
     auto_deployments_enabled = true
     authentication_configuration {
@@ -127,8 +134,11 @@ resource "aws_apprunner_service" "app" {
   }
 
   health_check_configuration {
-    protocol = "HTTP"
-    path     = "/health"
+    protocol            = "TCP"
+    interval            = 10
+    timeout             = 5
+    healthy_threshold   = 1
+    unhealthy_threshold = 5
   }
 }
 
