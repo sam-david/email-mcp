@@ -1,8 +1,12 @@
-# email-mcp — remote hosting on AWS App Runner (persistent container fits the
+# email-mcp — remote hosting on AWS App Runner (a persistent container fits the
 # stateful Streamable-HTTP MCP protocol), fronted by a custom domain in Route53.
 #
-# SCAFFOLD: not yet applied end-to-end. Review before `terraform apply`.
-# Flow: build+push image to ECR (see deploy/README.md) → apply.
+# Multi-tenant: the URL path selects the mailbox profile; each profile's creds +
+# bearer token live in its own Secrets Manager secret (email-mcp/<profile>).
+# Endpoint per profile: https://<domain>/<profile>
+#
+# SCAFFOLD: validated; expect to iterate on the first apply (App Runner custom
+# domain + IAM). Build+push the image before applying — see deploy/README.md.
 
 terraform {
   required_version = ">= 1.5"
@@ -10,52 +14,41 @@ terraform {
     aws    = { source = "hashicorp/aws", version = "~> 5.0" }
     random = { source = "hashicorp/random", version = "~> 3.5" }
   }
-  # Consider an S3 backend for shared state; local state by default.
 }
 
 provider "aws" {
   region = var.aws_region
 }
 
-locals {
-  from_address = var.mail_from_address != "" ? var.mail_from_address : var.mail_email
-}
+data "aws_caller_identity" "me" {}
 
-# ---------------------------------------------------------------------------
-# Container registry
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- ECR
 resource "aws_ecr_repository" "app" {
   name                 = var.service_name
   image_tag_mutability = "MUTABLE"
-  image_scanning_configuration { scan_on_push = true }
+  image_scanning_configuration {
+    scan_on_push = true
+  }
 }
 
-# ---------------------------------------------------------------------------
-# Secrets — mailbox password + a generated bearer token for the MCP endpoint
-# ---------------------------------------------------------------------------
-resource "aws_secretsmanager_secret" "mail_password" {
-  name = "${var.service_name}/mail_password"
-}
-resource "aws_secretsmanager_secret_version" "mail_password" {
-  secret_id     = aws_secretsmanager_secret.mail_password.id
-  secret_string = var.mail_password
+# ---------------------------------------------------------------- Secrets
+# One shell secret per profile. Populate the JSON value OUT OF BAND (see
+# deploy/README.md) so the mailbox password never lands in Terraform state.
+# New profiles can also be created directly with the CLI later — no redeploy,
+# since the instance role can read any email-mcp/* secret.
+resource "aws_secretsmanager_secret" "profile" {
+  for_each = toset(var.profiles)
+  name     = "${var.service_name}/${each.key}"
 }
 
+# A suggested bearer token per profile — use it when you populate the secret.
 resource "random_password" "bearer" {
-  length  = 48
-  special = false
-}
-resource "aws_secretsmanager_secret" "bearer" {
-  name = "${var.service_name}/bearer_token"
-}
-resource "aws_secretsmanager_secret_version" "bearer" {
-  secret_id     = aws_secretsmanager_secret.bearer.id
-  secret_string = random_password.bearer.result
+  for_each = toset(var.profiles)
+  length   = 48
+  special  = false
 }
 
-# ---------------------------------------------------------------------------
-# IAM — App Runner ECR access role + instance role (reads the two secrets)
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- IAM
 data "aws_iam_policy_document" "apprunner_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -65,10 +58,12 @@ data "aws_iam_policy_document" "apprunner_assume" {
     }
   }
 }
+
 resource "aws_iam_role" "apprunner_access" {
   name               = "${var.service_name}-apprunner-access"
   assume_role_policy = data.aws_iam_policy_document.apprunner_assume.json
 }
+
 resource "aws_iam_role_policy_attachment" "ecr_access" {
   role       = aws_iam_role.apprunner_access.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess"
@@ -83,25 +78,27 @@ data "aws_iam_policy_document" "instance_assume" {
     }
   }
 }
+
 resource "aws_iam_role" "instance" {
   name               = "${var.service_name}-instance"
   assume_role_policy = data.aws_iam_policy_document.instance_assume.json
 }
+
+# Read any email-mcp/* secret, so adding a profile needs no IAM change.
 data "aws_iam_policy_document" "read_secrets" {
   statement {
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.mail_password.arn, aws_secretsmanager_secret.bearer.arn]
+    resources = ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.me.account_id}:secret:${var.service_name}/*"]
   }
 }
+
 resource "aws_iam_role_policy" "read_secrets" {
   name   = "read-secrets"
   role   = aws_iam_role.instance.id
   policy = data.aws_iam_policy_document.read_secrets.json
 }
 
-# ---------------------------------------------------------------------------
-# App Runner service
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- App Runner
 resource "aws_apprunner_service" "app" {
   service_name = var.service_name
 
@@ -116,16 +113,8 @@ resource "aws_apprunner_service" "app" {
       image_configuration {
         port = "8080"
         runtime_environment_variables = {
-          MAIL_EMAIL        = var.mail_email
-          MAIL_FROM_NAME    = var.mail_from_name
-          MAIL_FROM_ADDRESS = local.from_address
-          MAIL_IMAP_HOST    = var.imap_host
-          MAIL_SMTP_HOST    = var.smtp_host
-          MAIL_DRY_RUN      = var.dry_run
-        }
-        runtime_environment_secrets = {
-          MAIL_PASSWORD    = aws_secretsmanager_secret.mail_password.arn
-          MCP_BEARER_TOKEN = aws_secretsmanager_secret.bearer.arn
+          SECRETS_PREFIX = "${var.service_name}/"
+          AWS_REGION     = var.aws_region
         }
       }
     }
@@ -143,10 +132,7 @@ resource "aws_apprunner_service" "app" {
   }
 }
 
-# ---------------------------------------------------------------------------
-# Custom domain in Route53 (App Runner manages the TLS cert; we add the
-# validation records + the CNAME to the App Runner target).
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- Domain (Route53)
 data "aws_route53_zone" "root" {
   name = var.route53_zone_name
 }
@@ -156,7 +142,7 @@ resource "aws_apprunner_custom_domain_association" "app" {
   service_arn = aws_apprunner_service.app.arn
 }
 
-# Certificate validation records (App Runner returns a set of CNAMEs to add).
+# Cert validation CNAMEs returned by App Runner.
 resource "aws_route53_record" "cert_validation" {
   for_each = {
     for r in aws_apprunner_custom_domain_association.app.certificate_validation_records : r.name => r

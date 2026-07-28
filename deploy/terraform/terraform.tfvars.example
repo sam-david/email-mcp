@@ -1,16 +1,8 @@
-# Copy to terraform.tfvars (gitignored) and fill in. Do NOT commit real values.
+# Copy to terraform.tfvars (gitignored) and adjust if needed.
+# No secrets go here — mailbox creds + bearer tokens live in Secrets Manager,
+# populated out of band (see deploy/README.md).
 
 aws_region        = "us-east-1"
 domain_name       = "mcp.samdavid.email"
 route53_zone_name = "samdavid.email"
-
-mail_email        = "hello@delawarevalleyaerial.com"
-mail_from_name    = "Sam David"
-mail_from_address = "sam@delawarevalleyaerial.com"
-imap_host         = "imappro.zoho.com"
-smtp_host         = "smtppro.zoho.com"
-dry_run           = "true"
-
-# The mailbox app-specific password. Prefer the env var instead of putting it
-# here:  export TF_VAR_mail_password='...'
-# mail_password = "..."
+profiles          = ["dva"]

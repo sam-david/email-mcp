@@ -1,64 +1,80 @@
-# Deploying email-mcp (remote HTTP)
+# Deploying email-mcp (remote, multi-tenant)
 
 Hosts the server as a remote **Streamable-HTTP MCP** so cloud / scheduled Claude
 agents can reach it. Target: **AWS App Runner** (a persistent container — the
 right fit for stateful MCP sessions) behind **`mcp.samdavid.email`** in Route53.
 
-> **Status: scaffold.** Reviewed but not yet applied. Expect to iterate on the
-> first `apply` (App Runner custom-domain + IAM details).
+**Multi-tenant:** the URL path selects the mailbox. Each profile is one Secrets
+Manager secret (`email-mcp/<profile>`) holding its creds *and* its bearer token.
+Endpoint per profile: `https://mcp.samdavid.email/<profile>`.
+
+> **Status: scaffold.** Validated, not yet applied end-to-end. Expect to iterate
+> on the first `apply` (App Runner custom-domain + IAM specifics).
 
 ## Why App Runner (not Lambda)
 
 MCP-over-HTTP is **stateful** (per-session transports). A long-running container
 holds sessions in memory naturally; Lambda's per-request statelessness fights
 that. App Runner runs the container as-is, terminates TLS, does custom domains,
-and scales down cheaply. Fargate/ECS would also work.
+and scales down cheaply.
 
-## One-time prerequisites
+## Prerequisites
 
-- An AWS account (ideally a **personal/tools** account, separate from any
-  business account) with the `samdavid.email` **Route53 hosted zone** in it.
-- Docker + AWS CLI + Terraform installed.
+- AWS account with the `samdavid.email` **Route53 hosted zone** in it.
+- Docker + AWS CLI (`--profile sam-admin`) + Terraform.
 
 ## Deploy
 
 ```bash
 cd deploy/terraform
-cp terraform.tfvars.example terraform.tfvars   # fill in (gitignored)
-export TF_VAR_mail_password='your-app-specific-password'
+cp terraform.tfvars.example terraform.tfvars   # adjust if needed
+export AWS_PROFILE=sam-admin
 
-# 1. Create the ECR repo (and secrets/roles) first
+# 1. Create ECR (+ secrets shells, IAM) first
 terraform init
 terraform apply -target=aws_ecr_repository.app
 
-# 2. Build + push the image
+# 2. Build + push the image (repo root context)
 REPO=$(terraform output -raw ecr_repository_url)
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "${REPO%/*}"
+aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO%/*}"
 docker build -t "$REPO:latest" ../..
 docker push "$REPO:latest"
 
-# 3. Apply the rest (App Runner + custom domain + Route53)
+# 3. Apply the rest (App Runner + custom domain + Route53 records)
 terraform apply
 ```
 
-## After apply
+## Populate a mailbox secret (the password never touches Terraform)
+
+Grab the suggested bearer token, then write the profile's JSON:
 
 ```bash
-terraform output mcp_endpoint          # https://mcp.samdavid.email/mcp
-terraform output -raw bearer_token     # the Authorization: Bearer value
+BEARER=$(terraform output -json profile_bearers | jq -r '.dva')
+
+aws secretsmanager put-secret-value --secret-id email-mcp/dva --secret-string "{
+  \"email\":       \"hello@delawarevalleyaerial.com\",
+  \"password\":    \"YOUR-APP-SPECIFIC-PASSWORD\",
+  \"fromName\":    \"Sam David\",
+  \"fromAddress\": \"sam@delawarevalleyaerial.com\",
+  \"imapHost\":    \"imappro.zoho.com\",
+  \"smtpHost\":    \"smtppro.zoho.com\",
+  \"dryRun\":      \"false\",
+  \"bearer\":      \"$BEARER\"
+}"
 ```
 
-Register in Claude as a **custom connector**:
-- **URL:** the `mcp_endpoint`
-- **Request header:** `Authorization: Bearer <bearer_token>`
+## Register in Claude (custom connector)
 
-Then verify `check_connection`, and that a **scheduled routine** can call it.
+- **URL:** `https://mcp.samdavid.email/dva`
+- **Request header:** `Authorization: Bearer <the dva bearer>`
 
-## Adding another mailbox
+Then run `check_connection`, and confirm a **scheduled routine** can call it.
 
-This scaffold deploys **one mailbox** (the `mail_*` vars → one App Runner
-service + its own secrets). For a second inbox, either run this module again
-with different vars (its own service + domain, e.g. `mcp2.samdavid.email`), or
-extend the server to resolve a per-request profile from the URL path and store
-one secret per profile. The server's config layer is already
-profile-structured to make the latter a small change.
+## Add another mailbox — no redeploy
+
+```bash
+# generate a token, then create the secret; the running service picks it up
+aws secretsmanager create-secret --name email-mcp/acme --secret-string '{...}'
+```
+Register a second Claude connector at `https://mcp.samdavid.email/acme` with
+that profile's bearer. Same service, same domain, different path.

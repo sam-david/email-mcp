@@ -9,13 +9,13 @@ variable "service_name" {
 }
 
 # Public hostname for the MCP endpoint (a subdomain — App Runner custom domains
-# can't be an apex). e.g. mcp.samdavid.email
+# can't be an apex). Endpoint per profile: https://<domain_name>/<profile>
 variable "domain_name" {
   type    = string
   default = "mcp.samdavid.email"
 }
 
-# The Route53 hosted zone the domain lives in. e.g. samdavid.email
+# The Route53 hosted zone the domain lives in.
 variable "route53_zone_name" {
   type    = string
   default = "samdavid.email"
@@ -26,41 +26,10 @@ variable "image_tag" {
   default = "latest"
 }
 
-# --- Mailbox config (non-secret) ---
-variable "mail_email" {
-  type        = string
-  description = "IMAP/SMTP login address (e.g. hello@delawarevalleyaerial.com)."
-}
-
-variable "mail_from_name" {
-  type    = string
-  default = ""
-}
-
-variable "mail_from_address" {
-  type        = string
-  description = "Verified alias to send as (e.g. sam@…). Defaults to mail_email if empty."
-  default     = ""
-}
-
-variable "imap_host" {
-  type    = string
-  default = "imappro.zoho.com"
-}
-
-variable "smtp_host" {
-  type    = string
-  default = "smtppro.zoho.com"
-}
-
-variable "dry_run" {
-  type    = string
-  default = "true"
-}
-
-# --- Secret (set via a gitignored *.tfvars, NEVER committed) ---
-variable "mail_password" {
-  type        = string
-  sensitive   = true
-  description = "App-specific password for the mailbox. Provide via a local tfvars or TF_VAR_mail_password."
+# Mailbox profiles to pre-create secret shells for. You can also add profiles
+# purely via the CLI later (the service reads any email-mcp/* secret) — no
+# redeploy needed. Each profile's JSON value is populated out-of-band.
+variable "profiles" {
+  type    = list(string)
+  default = ["dva"]
 }

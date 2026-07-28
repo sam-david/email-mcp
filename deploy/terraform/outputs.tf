@@ -5,16 +5,16 @@ output "ecr_repository_url" {
 
 output "service_url" {
   value       = "https://${aws_apprunner_service.app.service_url}"
-  description = "Default App Runner URL (works before the custom domain is live)."
+  description = "Default App Runner URL (works before the custom domain resolves)."
 }
 
-output "mcp_endpoint" {
-  value       = "https://${var.domain_name}/mcp"
-  description = "The MCP endpoint to register as a Claude custom connector."
+output "mcp_base" {
+  value       = "https://${var.domain_name}"
+  description = "MCP endpoint per profile: <mcp_base>/<profile>  (e.g. .../dva)"
 }
 
-output "bearer_token" {
-  value       = random_password.bearer.result
+output "profile_bearers" {
+  value       = { for k, r in random_password.bearer : k => r.result }
   sensitive   = true
-  description = "Authorization: Bearer <this>. Read with: terraform output -raw bearer_token"
+  description = "Suggested bearer token per profile. View: terraform output -json profile_bearers"
 }
