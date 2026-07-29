@@ -1,10 +1,18 @@
 // Builds an MCP server bound to a specific mail config. Stateless — safe to
 // create once (stdio) or one per request (HTTP).
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import { simpleParser } from "mailparser";
+import {
+  SchedulerClient,
+  CreateScheduleCommand,
+  DeleteScheduleCommand,
+  ListSchedulesCommand,
+} from "@aws-sdk/client-scheduler";
+import { sendMail } from "./send.mjs";
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const senderName = (env) =>
@@ -197,8 +205,94 @@ export function createServer(cfg, source = "process environment") {
       if (cfg.dryRun) {
         return text(`DRY RUN — not sent. Set MAIL_DRY_RUN=false to send for real.\n\n${preview}`);
       }
-      const info = await smtpTransport().sendMail({ from, to, cc, bcc, subject, text: body, html });
+      const info = await sendMail(cfg, { to, subject, body, cc, bcc, html });
       return text(`Sent ✓ (${info.messageId})\n\n${preview}`);
+    }
+  );
+
+  // ---- scheduled send: EventBridge Scheduler → send-worker Lambda ----
+  // Durable + server-side: fires at the target time whether or not any client
+  // is connected. Configured via env (set by Terraform on the host); inert locally.
+  const SCHED = {
+    workerArn: process.env.WORKER_LAMBDA_ARN,
+    roleArn: process.env.SCHEDULER_ROLE_ARN,
+    group: process.env.SCHEDULER_GROUP || "default",
+  };
+  const schedulingOn = () => Boolean(SCHED.workerArn && SCHED.roleArn);
+  const profileName = () => {
+    const m = /secretsmanager:.*\/([^/]+)$/.exec(source);
+    return m ? m[1] : process.env.MAIL_PROFILE || "default";
+  };
+  const scheduler = () => new SchedulerClient({});
+
+  server.registerTool(
+    "schedule_send",
+    {
+      title: "Schedule an email to send later",
+      description:
+        "Queue an email to be sent at a future time — durable and server-side, independent of any client. send_at is ISO 8601 (UTC recommended, e.g. 2026-08-01T14:30:00Z).",
+      inputSchema: {
+        to: z.string().describe("Recipient address(es), comma-separated"),
+        subject: z.string(),
+        body: z.string().describe("Plain-text body"),
+        send_at: z.string().describe("When to send, ISO 8601 (e.g. 2026-08-01T14:30:00Z)"),
+        cc: z.string().optional(),
+        bcc: z.string().optional(),
+        html: z.string().optional(),
+      },
+    },
+    async ({ to, subject, body, send_at, cc, bcc, html }) => {
+      if (!schedulingOn()) return text("Scheduling isn't configured on this server (no worker Lambda / role).");
+      const when = new Date(send_at);
+      if (isNaN(when.getTime())) return text(`Invalid send_at "${send_at}". Use ISO 8601, e.g. 2026-08-01T14:30:00Z.`);
+      if (when.getTime() <= Date.now() + 60_000) return text("send_at must be at least a minute in the future.");
+      const from = cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
+      const preview = `From: ${from}\nTo: ${to}\nSubject: ${subject}\nSend at: ${when.toISOString()}\n\n${body}`;
+      if (cfg.dryRun) return text(`DRY RUN — not scheduled. Set MAIL_DRY_RUN=false to schedule for real.\n\n${preview}`);
+      const name = `emailmcp-${profileName()}-${randomUUID()}`;
+      await scheduler().send(
+        new CreateScheduleCommand({
+          Name: name,
+          GroupName: SCHED.group,
+          ScheduleExpression: `at(${when.toISOString().slice(0, 19)})`, // yyyy-mm-ddThh:mm:ss
+          ScheduleExpressionTimezone: "UTC",
+          FlexibleTimeWindow: { Mode: "OFF" },
+          ActionAfterCompletion: "DELETE", // self-clean after it fires
+          Target: {
+            Arn: SCHED.workerArn,
+            RoleArn: SCHED.roleArn,
+            Input: JSON.stringify({ profile: profileName(), to, subject, body, cc, bcc, html }),
+          },
+        })
+      );
+      return text(`Scheduled ✓ — sends at ${when.toISOString()}\nid: ${name}\n\n${preview}`);
+    }
+  );
+
+  server.registerTool(
+    "list_scheduled",
+    { title: "List scheduled sends", description: "List pending scheduled emails for this mailbox.", inputSchema: {} },
+    async () => {
+      if (!schedulingOn()) return text("Scheduling isn't configured on this server.");
+      const out = await scheduler().send(
+        new ListSchedulesCommand({ GroupName: SCHED.group, NamePrefix: `emailmcp-${profileName()}-` })
+      );
+      const names = (out.Schedules || []).map((s) => s.Name);
+      return text(names.length ? names.join("\n") : "(no scheduled sends)");
+    }
+  );
+
+  server.registerTool(
+    "cancel_scheduled",
+    {
+      title: "Cancel a scheduled send",
+      description: "Cancel a pending scheduled email by its id (from schedule_send / list_scheduled).",
+      inputSchema: { id: z.string().describe("The schedule id (name)") },
+    },
+    async ({ id }) => {
+      if (!schedulingOn()) return text("Scheduling isn't configured on this server.");
+      await scheduler().send(new DeleteScheduleCommand({ Name: id, GroupName: SCHED.group }));
+      return text(`Canceled ${id}`);
     }
   );
 

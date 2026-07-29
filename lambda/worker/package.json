@@ -1,0 +1,12 @@
+{
+  "name": "email-mcp-send-worker",
+  "version": "1.0.0",
+  "description": "Lambda invoked by EventBridge Scheduler to deliver a scheduled email.",
+  "type": "module",
+  "private": true,
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "nodemailer": "^6.9.14"
+  }
+}
