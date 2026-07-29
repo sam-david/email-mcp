@@ -55,11 +55,23 @@ export function createServer(cfg, source = "process environment") {
     },
     async () => {
       const out = [];
-      await withImap(async (c) => {
-        const mb = await c.mailboxOpen("INBOX", { readOnly: true });
-        out.push(`IMAP OK — ${cfg.email} @ ${cfg.imapHost}:${cfg.imapPort} (INBOX: ${mb.exists} messages)`);
-      });
-      await new Promise((res, rej) => smtpTransport().verify((e) => (e ? rej(e) : res())));
+      try {
+        await withImap(async (c) => {
+          const mb = await c.mailboxOpen("INBOX", { readOnly: true });
+          out.push(`IMAP OK — ${cfg.email} @ ${cfg.imapHost}:${cfg.imapPort} (INBOX: ${mb.exists} messages)`);
+        });
+      } catch (e) {
+        return text(
+          `IMAP FAILED (${cfg.email} @ ${cfg.imapHost}:${cfg.imapPort}): ` +
+            `${e.responseText || e.serverResponseCode || e.code || e.message}` +
+            (e.authenticationFailed ? " — authentication failed; check the app password" : "")
+        );
+      }
+      try {
+        await new Promise((res, rej) => smtpTransport().verify((e) => (e ? rej(e) : res())));
+      } catch (e) {
+        return text(`IMAP OK, but SMTP FAILED (${cfg.smtpHost}:${cfg.smtpPort}): ${e.response || e.message}`);
+      }
       out.push(`SMTP OK — ${cfg.smtpHost}:${cfg.smtpPort}`);
       out.push(
         `Sending as: ${cfg.fromAddress}` +
