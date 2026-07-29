@@ -12,3 +12,4 @@ crash.log
 crash.*.log
 override.tf
 override.tf.json
+deploy/terraform/build/

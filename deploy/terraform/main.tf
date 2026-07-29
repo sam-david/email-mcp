@@ -11,8 +11,9 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    aws    = { source = "hashicorp/aws", version = "~> 5.0" }
-    random = { source = "hashicorp/random", version = "~> 3.5" }
+    aws     = { source = "hashicorp/aws", version = "~> 5.0" }
+    random  = { source = "hashicorp/random", version = "~> 3.5" }
+    archive = { source = "hashicorp/archive", version = "~> 2.4" }
   }
 }
 
@@ -120,8 +121,11 @@ resource "aws_apprunner_service" "app" {
       image_configuration {
         port = "8080"
         runtime_environment_variables = {
-          SECRETS_PREFIX = "${var.service_name}/"
-          AWS_REGION     = var.aws_region
+          SECRETS_PREFIX     = "${var.service_name}/"
+          AWS_REGION         = var.aws_region
+          WORKER_LAMBDA_ARN  = aws_lambda_function.worker.arn
+          SCHEDULER_ROLE_ARN = aws_iam_role.scheduler.arn
+          SCHEDULER_GROUP    = aws_scheduler_schedule_group.email.name
         }
       }
     }
