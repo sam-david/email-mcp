@@ -23,6 +23,20 @@
 import { createHmac, createHash, timingSafeEqual } from "node:crypto";
 
 const SCOPE = "mailbox";
+
+// The authorization-request parameters. The consent form re-submits all of
+// them, so this list is the single source of truth for what survives the
+// GET -> user approval -> POST round trip.
+const AUTH_PARAMS = [
+  "response_type",
+  "client_id",
+  "redirect_uri",
+  "state",
+  "code_challenge",
+  "code_challenge_method",
+  "scope",
+  "resource",
+];
 const CODE_TTL = 300; // 5 min
 const ACCESS_TTL = 8 * 3600; // 8 h
 const REFRESH_TTL = 60 * 86400; // 60 d
@@ -170,9 +184,11 @@ export function matchOAuth(pathname) {
 
 // ---------------------------------------------------------------- consent page
 function consentPage({ profile, clientName, params, error }) {
-  const hidden = ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "resource"]
-    .map((k) => (params[k] ? `<input type="hidden" name="${k}" value="${esc(params[k])}">` : ""))
-    .join("");
+  // Every authorization parameter must round-trip through the form: on POST the
+  // browser sends these hidden fields and nothing else, so anything omitted
+  // here reads as absent and fails validation. Omitting response_type made the
+  // approval redirect back with unsupported_response_type instead of a code.
+  const hidden = AUTH_PARAMS.map((k) => (params[k] ? `<input type="hidden" name="${k}" value="${esc(params[k])}">` : "")).join("");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Authorize email-mcp</title><style>

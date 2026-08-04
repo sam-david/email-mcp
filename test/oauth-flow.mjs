@@ -101,12 +101,25 @@ const consent = await fetch(`${asm.authorization_endpoint}?${authParams}`);
 const consentHtml = await consent.text();
 check("GET /authorize renders a consent page", consent.status === 200 && consentHtml.includes("Authorize"), `status ${consent.status}`);
 
+// Submit exactly what the rendered form submits — NOT a body rebuilt from the
+// original params. A browser posts the hidden fields and nothing else, so any
+// parameter the page fails to round-trip is missing on POST. Rebuilding the
+// body here once hid a real bug: response_type was absent from the form, and
+// every approval redirected back with unsupported_response_type.
+const formFields = Object.fromEntries(
+  [...consentHtml.matchAll(/<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"/g)].map((m) => [m[1], m[2]])
+);
+for (const p of ["response_type", "client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method"]) {
+  check(`consent form round-trips ${p}`, formFields[p] === authParams.get(p), `form=${formFields[p]} param=${authParams.get(p)}`);
+}
+const asBrowser = (extra) => new URLSearchParams({ ...formFields, ...extra });
+
 // wrong token must NOT mint a code
 const wrong = await fetch(asm.authorization_endpoint, {
   method: "POST",
   headers: { "content-type": "application/x-www-form-urlencoded" },
   redirect: "manual",
-  body: new URLSearchParams({ ...Object.fromEntries(authParams), decision: "allow", access_token: "not-the-token" }),
+  body: asBrowser({ decision: "allow", access_token: "not-the-token" }),
 });
 check("wrong token is rejected", wrong.status === 401 && !wrong.headers.get("location"), `status ${wrong.status}`);
 
@@ -115,7 +128,7 @@ const denied = await fetch(asm.authorization_endpoint, {
   method: "POST",
   headers: { "content-type": "application/x-www-form-urlencoded" },
   redirect: "manual",
-  body: new URLSearchParams({ ...Object.fromEntries(authParams), decision: "deny", access_token: BEARER }),
+  body: asBrowser({ decision: "deny", access_token: BEARER }),
 });
 check("deny redirects with access_denied", new URL(denied.headers.get("location")).searchParams.get("error") === "access_denied");
 
@@ -124,7 +137,7 @@ const tampered = await fetch(asm.authorization_endpoint, {
   method: "POST",
   headers: { "content-type": "application/x-www-form-urlencoded" },
   redirect: "manual",
-  body: new URLSearchParams({ ...Object.fromEntries(authParams), redirect_uri: "https://attacker.example/steal", decision: "allow", access_token: BEARER }),
+  body: asBrowser({ redirect_uri: "https://attacker.example/steal", decision: "allow", access_token: BEARER }),
 });
 check("unregistered redirect_uri is refused", tampered.status === 400 && !tampered.headers.get("location"), `status ${tampered.status}`);
 
@@ -133,7 +146,7 @@ const approved = await fetch(asm.authorization_endpoint, {
   method: "POST",
   headers: { "content-type": "application/x-www-form-urlencoded" },
   redirect: "manual",
-  body: new URLSearchParams({ ...Object.fromEntries(authParams), decision: "allow", access_token: BEARER }),
+  body: asBrowser({ decision: "allow", access_token: BEARER }),
 });
 const cb = new URL(approved.headers.get("location"));
 const code = cb.searchParams.get("code");

@@ -74,6 +74,15 @@ export function startHttp() {
   }
 
   const httpServer = http.createServer(async (req, res) => {
+    // One line per request to stdout, which App Runner ships to CloudWatch.
+    // Path only, never the query string or body: authorization codes, tokens
+    // and the consent password travel in those. Without this there is no way
+    // to tell a failing OAuth handshake apart from one that never arrived.
+    const started = Date.now();
+    res.on("finish", () => {
+      console.log(`${req.method} ${req.url.split("?")[0]} -> ${res.statusCode} (${Date.now() - started}ms)`);
+    });
+
     if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("email-mcp ok");
