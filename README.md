@@ -20,9 +20,47 @@ touches the mailbox.
 |------|---------|
 | `check_connection` | Verify IMAP login + SMTP readiness (no send); reports the active config source |
 | `list_messages` | Recent messages in a mailbox (from/subject/date/uid) |
-| `read_message` | Full text of one message by UID |
+| `read_message` | Full text of one message by UID, plus any attachments it carries |
 | `search_messages` | Keyword search across from/subject/body |
-| `send_email` | Send mail (respects dry-run) |
+| `get_attachment` | Download one attachment from a message |
+| `send_email` | Send mail, with attachments (respects dry-run) |
+| `schedule_send` · `list_scheduled` · `cancel_scheduled` | Server-side scheduled sending (remote deployment only) |
+
+### Attachments
+
+The awkward question is *where the bytes come from*, and the answer differs by
+transport, so each attachment names exactly one source:
+
+| Source | Works where | Use it for |
+|--------|-------------|------------|
+| `path` | **stdio only** — the server is a local subprocess, so the filesystem is yours | attaching a file on your machine |
+| `content_base64` | everywhere | content the model generated itself (a CSV, a report) — and the only option a claude.ai connector has |
+| `from_uid` | everywhere | re-attaching a file already on a message in the mailbox (forwarding) |
+
+```jsonc
+// local: attach a file from disk
+{ "attachments": [{ "path": "/Users/you/invoice.pdf" }] }
+
+// anywhere: attach generated content
+{ "attachments": [{ "filename": "q3.csv", "content_base64": "bmFtZSxjb3VudAo..." }] }
+
+// forward what someone sent you
+{ "attachments": [{ "from_uid": 8412, "from_filename": "contract.pdf" }] }
+```
+
+Over HTTP, `path` is **refused** rather than honoured: it would read the
+*server's* disk on behalf of a remote caller. Fetching attachments from a URL is
+deliberately not supported either — it would give any caller a general-purpose
+outbound request and break the guarantee below.
+
+Limits are **20 MB per file, 25 MB total** — the mail provider's ceiling, the
+same one Mac Mail hits. Two exceptions, both documented in [TODO.md](TODO.md):
+
+- `schedule_send` allows only **150 KB**, because deferred bytes currently wait
+  inside an EventBridge Scheduler payload, which AWS caps at 256 KB.
+- `content_base64` over the remote transport is bounded well below 25 MB in
+  practice, since the bytes travel inside the tool call itself. Prefer `from_uid`
+  for anything large.
 
 ## Configuration model — profiles
 
@@ -90,6 +128,26 @@ claude mcp add email -e MAIL_PROFILE=acme -- node /Users/sam/code/projects/email
 ```
 
 One server, many mailboxes, zero secrets in the repo.
+
+## Remote hosting
+
+The server also speaks **Streamable HTTP** (`MCP_HTTP=1` or set `PORT`) so cloud
+and scheduled Claude agents can reach it — see [`deploy/`](deploy/README.md) for
+the AWS App Runner setup.
+
+Two ways in, both checked against the same per-profile bearer token:
+
+- **Static bearer** — Claude Code (`--header "Authorization: Bearer …"`) and the
+  Messages API MCP connector (`authorization_token`).
+- **OAuth 2.1** — claude.ai / Claude Desktop custom connectors, whose UI has no
+  header field. The server is its own authorization server (`src/oauth.mjs`):
+  RFC 9728 protected-resource metadata, RFC 8414 AS metadata, RFC 7591 dynamic
+  client registration, and a PKCE (S256) code flow. The consent page asks for
+  that same bearer token, so there's no second credential to manage.
+
+Registrations, authorization codes and tokens are stateless HMAC blobs signed
+with a key derived from the profile's bearer — no database, and rotating a
+bearer revokes every token issued for that mailbox.
 
 ## Provider hosts
 

@@ -9,7 +9,10 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "check": "node --check src/index.mjs"
+    "check": "node --check src/index.mjs",
+    "test": "node test/oauth-flow.mjs && node test/attachments.mjs",
+    "test:oauth": "node test/oauth-flow.mjs",
+    "test:attachments": "node test/attachments.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-scheduler": "^3.1097.0",

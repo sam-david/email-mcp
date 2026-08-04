@@ -100,8 +100,21 @@ resource "aws_iam_role_policy" "read_secrets" {
 }
 
 # ---------------------------------------------------------------- App Runner
+# MCP-over-HTTP sessions live in the container's memory and App Runner has no
+# session affinity, so a second instance would answer with "unknown session id"
+# for a session opened on the first. Pin to exactly one instance: this is a
+# single-mailbox tool that will never need to scale out, and the failure mode is
+# confusing (auth succeeds, sessions break at random).
+resource "aws_apprunner_auto_scaling_configuration_version" "app" {
+  auto_scaling_configuration_name = var.service_name
+  max_concurrency                 = 100
+  min_size                        = 1
+  max_size                        = 1
+}
+
 resource "aws_apprunner_service" "app" {
-  service_name = var.service_name
+  service_name                   = var.service_name
+  auto_scaling_configuration_arn = aws_apprunner_auto_scaling_configuration_version.app.arn
 
   # Ensure the access role can actually pull from ECR (and the instance role can
   # read secrets) BEFORE the service tries to deploy.
@@ -126,6 +139,9 @@ resource "aws_apprunner_service" "app" {
           WORKER_LAMBDA_ARN  = aws_lambda_function.worker.arn
           SCHEDULER_ROLE_ARN = aws_iam_role.scheduler.arn
           SCHEDULER_GROUP    = aws_scheduler_schedule_group.email.name
+          # OAuth metadata advertises absolute URLs; pin them to the custom
+          # domain rather than inferring the scheme/host from proxy headers.
+          PUBLIC_BASE_URL = "https://${var.domain_name}"
         }
       }
     }

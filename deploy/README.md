@@ -8,6 +8,21 @@ right fit for stateful MCP sessions) behind **`mcp.samdavid.email`** in Route53.
 Manager secret (`email-mcp/<profile>`) holding its creds *and* its bearer token.
 Endpoint per profile: `https://mcp.samdavid.email/<profile>`.
 
+**Auth:** each profile is its own OAuth 2.1 issuer, so a profile URL is both the
+MCP resource and its authorization server:
+
+| Path | Purpose |
+|------|---------|
+| `/<profile>` | the MCP endpoint (also `/<profile>/mcp`) |
+| `/.well-known/oauth-protected-resource/<profile>` | RFC 9728 — what the 401 points at |
+| `/.well-known/oauth-authorization-server/<profile>` | RFC 8414 |
+| `/<profile>/register` | RFC 7591 dynamic client registration |
+| `/<profile>/authorize` · `/<profile>/token` | PKCE (S256) authorization code flow |
+
+Nothing is stored server-side: registrations, codes and tokens are HMAC blobs
+signed with a key derived from that profile's bearer, so they survive restarts
+and extra instances without a database.
+
 > **Status: scaffold.** Validated, not yet applied end-to-end. Expect to iterate
 > on the first `apply` (App Runner custom-domain + IAM specifics).
 
@@ -63,12 +78,41 @@ aws secretsmanager put-secret-value --secret-id email-mcp/dva --secret-string "{
 }"
 ```
 
-## Register in Claude (custom connector)
+## Register in Claude
+
+The profile's bearer token is the one credential, but different Claude surfaces
+present it differently.
+
+### claude.ai / Claude Desktop — custom connector (OAuth)
+
+The connector UI has no request-header field, so it needs the OAuth 2.1 flow
+the server implements (see `src/oauth.mjs`). Just add the URL:
 
 - **URL:** `https://mcp.samdavid.email/dva`
-- **Request header:** `Authorization: Bearer <the dva bearer>`
+
+Claude discovers the endpoints, registers itself dynamically, and opens a
+consent page. **Paste the profile's bearer token there** — that's the login.
+Claude then holds a short-lived access token plus a refresh token; you won't be
+asked again unless the bearer is rotated.
+
+### Claude Code — static bearer
+
+```bash
+claude mcp add --transport http email https://mcp.samdavid.email/dva \
+  --header "Authorization: Bearer <the dva bearer>"
+```
+
+### Messages API MCP connector
+
+Pass the bearer as `authorization_token` on the server definition.
 
 Then run `check_connection`, and confirm a **scheduled routine** can call it.
+
+### Rotating / revoking
+
+OAuth tokens are signed with a key derived from the profile's bearer, so
+changing `bearer` in the secret invalidates every token ever issued for that
+mailbox. Rotate the bearer to cut off access; re-add the connector to restore it.
 
 ## Add another mailbox — no redeploy
 
