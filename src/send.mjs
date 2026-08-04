@@ -6,12 +6,23 @@ export function buildFrom(cfg) {
   return cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
 }
 
-export async function sendMail(cfg, { to, subject, body, cc, bcc, html }) {
+// `attachments` is already in nodemailer form ({ filename, content, contentType })
+// — see attachments.mjs, which resolves the various byte sources into it.
+export async function sendMail(cfg, { to, subject, body, cc, bcc, html, attachments }) {
   const transport = nodemailer.createTransport({
     host: cfg.smtpHost,
     port: cfg.smtpPort,
     secure: cfg.smtpPort === 465,
     auth: { user: cfg.email, pass: cfg.pass },
   });
-  return transport.sendMail({ from: buildFrom(cfg), to, cc, bcc, subject, text: body, html });
+  return transport.sendMail({
+    from: buildFrom(cfg),
+    to,
+    cc,
+    bcc,
+    subject,
+    text: body,
+    html,
+    ...(attachments?.length ? { attachments } : {}),
+  });
 }

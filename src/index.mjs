@@ -23,5 +23,8 @@ if (httpMode) {
   startHttp();
 } else {
   const { cfg, source } = resolveConfig();
-  await createServer(cfg, source).connect(new StdioServerTransport());
+  // Over stdio the server is a subprocess on the user's own machine, so
+  // attachments may be read from / written to local paths. The HTTP transport
+  // deliberately does not enable this — see attachments.mjs.
+  await createServer(cfg, source, { allowLocalFiles: true }).connect(new StdioServerTransport());
 }
