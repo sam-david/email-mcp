@@ -33,11 +33,15 @@ transport, so each attachment names exactly one source:
 
 | Source | Works where | Use it for |
 |--------|-------------|------------|
+| `asset` | remote deployment | **a large file you send often** — a pricing sheet, a capability deck |
 | `path` | **stdio only** — the server is a local subprocess, so the filesystem is yours | attaching a file on your machine |
-| `content_base64` | everywhere | content the model generated itself (a CSV, a report) — and the only option a claude.ai connector has |
+| `content_base64` | everywhere | content the model generated itself (a CSV, a report) |
 | `from_uid` | everywhere | re-attaching a file already on a message in the mailbox (forwarding) |
 
 ```jsonc
+// anywhere, any size: a file saved on the server once (see below)
+{ "attachments": [{ "asset": "pricing-sheet" }] }
+
 // local: attach a file from disk
 { "attachments": [{ "path": "/Users/you/invoice.pdf" }] }
 
@@ -54,13 +58,31 @@ deliberately not supported either — it would give any caller a general-purpose
 outbound request and break the guarantee below.
 
 Limits are **20 MB per file, 25 MB total** — the mail provider's ceiling, the
-same one Mac Mail hits. Two exceptions, both documented in [TODO.md](TODO.md):
+same one Mac Mail hits. `schedule_send` matches it, because scheduled
+attachments wait in S3 rather than inside the EventBridge Scheduler payload
+(which AWS caps at 256 KB).
 
-- `schedule_send` allows only **150 KB**, because deferred bytes currently wait
-  inside an EventBridge Scheduler payload, which AWS caps at 256 KB.
-- `content_base64` over the remote transport is bounded well below 25 MB in
-  practice, since the bytes travel inside the tool call itself. Prefer `from_uid`
-  for anything large.
+The one real constraint is `content_base64`: those bytes travel *inside the MCP
+tool call*, so it is bounded well below 25 MB in practice regardless of the
+configured limit. For anything large use `asset` or `from_uid`, which move
+bytes server-side and cost nothing.
+
+### Saved assets
+
+A file you attach repeatedly should be uploaded once and referenced by name.
+The bytes then never pass through a tool call, so size stops mattering and it
+works identically from a headless scheduled routine.
+
+```bash
+./deploy/asset.sh put pricing-sheet ~/Desktop/pricing-2026.pdf
+./deploy/asset.sh list
+```
+
+Then, from any Claude surface: *"schedule the follow-up for Tuesday 9am with the
+pricing sheet attached"* → `{ "asset": "pricing-sheet" }`. Re-run `put` with the
+same name to update it; every later send picks up the new version. `list_assets`
+lets Claude discover what is available, and `save_asset` / `delete_asset` manage
+them without dropping to a shell.
 
 ## Configuration model — profiles
 

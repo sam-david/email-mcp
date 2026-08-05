@@ -51,7 +51,10 @@ resource "aws_lambda_function" "worker" {
   timeout          = 30
   memory_size      = 256
   environment {
-    variables = { SECRETS_PREFIX = "${var.service_name}/" }
+    variables = {
+      SECRETS_PREFIX = "${var.service_name}/"
+      ASSETS_BUCKET  = aws_s3_bucket.attachments.bucket
+    }
   }
 }
 

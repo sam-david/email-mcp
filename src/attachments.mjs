@@ -14,16 +14,24 @@
 //   from_uid        re-attach a file already sitting on a message in the
 //                   mailbox — forwarding. Needs no I/O beyond the IMAP
 //                   connection we already hold.
+//   asset           a file uploaded once and referenced by name thereafter
+//                   (a pricing sheet, a capability deck). The bytes live in
+//                   S3 and never travel through a tool call, so size stops
+//                   mattering and it costs nothing to attach the same 4 MB PDF
+//                   to every send. See storage.mjs.
 //
 // Deliberately absent: fetching a URL. This server's security claim is that it
 // talks only to the configured mail hosts, and a URL fetcher would hand any
-// caller a general-purpose outbound request.
+// caller a general-purpose outbound request. Assets are not an exception —
+// they come from a bucket this deployment owns, named by a slug, not a
+// caller-supplied address.
 import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import { simpleParser } from "mailparser";
 // The same table nodemailer uses when it fills in a missing contentType, so a
 // send preview names the exact type that will go out on the wire.
 import mimeTypes from "nodemailer/lib/mime-funcs/mime-types.js";
+import { getAsset, storageOn } from "./storage.mjs";
 
 // Most providers reject well before this (Zoho ~20 MB, Gmail 25 MB); fail here
 // with something readable rather than after a long upload.
@@ -69,11 +77,31 @@ export async function resolveAttachments(specs, { allowLocalFiles = false, withI
 
   for (const [i, a] of specs.entries()) {
     const label = `attachment ${i + 1}`;
-    const given = ["path", "content_base64", "from_uid"].filter((k) => a[k] !== undefined && a[k] !== null && a[k] !== "");
+    const given = ["path", "content_base64", "from_uid", "asset"].filter(
+      (k) => a[k] !== undefined && a[k] !== null && a[k] !== ""
+    );
     if (given.length !== 1) {
       throw new Error(
-        `${label}: give exactly one of path, content_base64 or from_uid — got ${given.length ? given.join(" + ") : "none"}.`
+        `${label}: give exactly one of path, content_base64, from_uid or asset — got ${given.length ? given.join(" + ") : "none"}.`
       );
+    }
+
+    if (a.asset) {
+      if (!storageOn()) {
+        throw new Error(
+          `${label}: named assets need the remote deployment (no asset storage configured here). Use path locally, or content_base64.`
+        );
+      }
+      const got = await getAsset(a.asset);
+      if (got.content.length > MAX_ONE) {
+        throw new Error(`${label}: asset "${a.asset}" is ${human(got.content.length)}; the per-file limit is ${human(MAX_ONE)}.`);
+      }
+      out.push({
+        filename: a.filename || got.filename,
+        content: got.content,
+        contentType: a.content_type || got.contentType || undefined,
+      });
+      continue;
     }
 
     if (a.path !== undefined && a.path !== "") {

@@ -121,6 +121,7 @@ resource "aws_apprunner_service" "app" {
   depends_on = [
     aws_iam_role_policy_attachment.ecr_access,
     aws_iam_role_policy.read_secrets,
+    aws_iam_role_policy.server_attachments,
   ]
 
   source_configuration {
@@ -142,6 +143,7 @@ resource "aws_apprunner_service" "app" {
           # OAuth metadata advertises absolute URLs; pin them to the custom
           # domain rather than inferring the scheme/host from proxy headers.
           PUBLIC_BASE_URL = "https://${var.domain_name}"
+          ASSETS_BUCKET   = aws_s3_bucket.attachments.bucket
         }
       }
     }

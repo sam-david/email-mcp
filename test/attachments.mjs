@@ -88,6 +88,42 @@ await rejects(
   "not available"
 );
 
+// ---- named assets ----
+// Storage is inert without ASSETS_BUCKET, which is exactly the local/stdio
+// case, so these cover the off path and the naming rules. The S3 round trip
+// itself is exercised against the real bucket after deploy.
+{
+  const { storageOn, assertAssetName } = await import("../src/storage.mjs");
+  check("storage is off without ASSETS_BUCKET", storageOn() === false);
+
+  for (const good of ["pricing-sheet", "deck_v2", "a", "Q3.2026-rates.pdf"]) {
+    let ok = true;
+    try { assertAssetName(good); } catch { ok = false; }
+    check(`asset name accepted: ${good}`, ok);
+  }
+  for (const bad of ["../etc/passwd", "has space", "", "a/b", "x".repeat(65), "-leading"]) {
+    let rejected = false;
+    try { assertAssetName(bad); } catch { rejected = true; }
+    check(`asset name rejected: ${JSON.stringify(bad)}`, rejected);
+  }
+
+  await rejects(
+    "asset source explains itself when storage is unconfigured",
+    () => resolveAttachments([{ asset: "pricing-sheet" }], { allowLocalFiles: true }),
+    "need the remote deployment"
+  );
+  await rejects(
+    "asset counts as a byte source (asset + path rejected)",
+    () => resolveAttachments([{ asset: "x", path: filePath }], { allowLocalFiles: true }),
+    "exactly one"
+  );
+  await rejects(
+    "the one-source error now names asset",
+    () => resolveAttachments([{ filename: "x.txt" }], { allowLocalFiles: true }),
+    "or asset"
+  );
+}
+
 // ---- limits ----
 const big = join(dir, "big.bin");
 await writeFile(big, Buffer.alloc(MAX_ONE + 1024));

@@ -19,8 +19,10 @@ import {
   describe as describeAttachments,
   human,
   MAX_ONE,
+  MAX_TOTAL,
   MAX_SCHEDULED_TOTAL,
 } from "./attachments.mjs";
+import { storageOn, listAssets, putAsset, deleteAsset, spoolPending, dropPending } from "./storage.mjs";
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const senderName = (env) =>
@@ -40,6 +42,10 @@ const attachmentSchema = z.object({
   from_uid: z.number().int().optional().describe("Re-attach files from an existing message with this UID (forwarding)."),
   from_mailbox: z.string().optional().describe("Mailbox holding from_uid, default INBOX."),
   from_filename: z.string().optional().describe("Which attachment on that message; omit to take all of them."),
+  asset: z
+    .string()
+    .optional()
+    .describe("Name of a file already saved on the server (see list_assets) — the way to attach a large recurring file like a pricing sheet at no cost."),
 });
 
 // `allowLocalFiles` is true only for the stdio transport, where the server is a
@@ -328,7 +334,7 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
         attachments: z
           .array(attachmentSchema)
           .optional()
-          .describe(`Files to attach. Read at schedule time, and limited to ${human(MAX_SCHEDULED_TOTAL)} total — much smaller than for an immediate send.`),
+          .describe("Files to attach. Resolved to bytes at schedule time and parked in S3 until the send fires."),
       },
     },
     async ({ to, subject, body, send_at, cc, bcc, html, attachments }) => {
@@ -337,13 +343,16 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
       if (isNaN(when.getTime())) return text(`Invalid send_at "${send_at}". Use ISO 8601, e.g. 2026-08-01T14:30:00Z.`);
       if (when.getTime() <= Date.now() + 60_000) return text("send_at must be at least a minute in the future.");
 
-      // Resolve to bytes NOW and carry them in the schedule payload: at fire
-      // time the Lambda has no access to a local path, and the source message
-      // may have moved or been deleted.
+      // Resolve to bytes NOW: at fire time the Lambda cannot see a local path,
+      // and a source message may have moved or been deleted. Where S3 is
+      // configured the bytes are spooled there and the payload carries keys, so
+      // the 256 KB Scheduler limit stops constraining attachment size; without
+      // it we fall back to inlining, which is why the smaller cap still exists.
+      const spooling = storageOn();
       const files = await resolveAttachments(attachments, {
         allowLocalFiles,
         withImap,
-        maxTotal: MAX_SCHEDULED_TOTAL,
+        maxTotal: spooling ? MAX_TOTAL : MAX_SCHEDULED_TOTAL,
       });
 
       const from = cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
@@ -353,38 +362,41 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
         `\n\n${body}`;
       if (cfg.dryRun) return text(`DRY RUN — not scheduled. Set MAIL_DRY_RUN=false to schedule for real.\n\n${preview}`);
       const name = `emailmcp-${profileName()}-${randomUUID()}`;
-      await scheduler().send(
-        new CreateScheduleCommand({
-          Name: name,
-          GroupName: SCHED.group,
-          ScheduleExpression: `at(${when.toISOString().slice(0, 19)})`, // yyyy-mm-ddThh:mm:ss
-          ScheduleExpressionTimezone: "UTC",
-          FlexibleTimeWindow: { Mode: "OFF" },
-          ActionAfterCompletion: "DELETE", // self-clean after it fires
-          Target: {
-            Arn: SCHED.workerArn,
-            RoleArn: SCHED.roleArn,
-            Input: JSON.stringify({
-              profile: profileName(),
-              to,
-              subject,
-              body,
-              cc,
-              bcc,
-              html,
-              ...(files.length
-                ? {
-                    attachments: files.map((f) => ({
-                      filename: f.filename,
-                      content_base64: f.content.toString("base64"),
-                      content_type: f.contentType,
-                    })),
-                  }
-                : {}),
-            }),
-          },
-        })
-      );
+
+      let payloadAttachments = {};
+      if (files.length) {
+        payloadAttachments = spooling
+          ? { attachment_keys: await spoolPending(name, files) }
+          : {
+              attachments: files.map((f) => ({
+                filename: f.filename,
+                content_base64: f.content.toString("base64"),
+                content_type: f.contentType,
+              })),
+            };
+      }
+
+      try {
+        await scheduler().send(
+          new CreateScheduleCommand({
+            Name: name,
+            GroupName: SCHED.group,
+            ScheduleExpression: `at(${when.toISOString().slice(0, 19)})`, // yyyy-mm-ddThh:mm:ss
+            ScheduleExpressionTimezone: "UTC",
+            FlexibleTimeWindow: { Mode: "OFF" },
+            ActionAfterCompletion: "DELETE", // self-clean after it fires
+            Target: {
+              Arn: SCHED.workerArn,
+              RoleArn: SCHED.roleArn,
+              Input: JSON.stringify({ profile: profileName(), to, subject, body, cc, bcc, html, ...payloadAttachments }),
+            },
+          })
+        );
+      } catch (e) {
+        // Don't leave orphaned bytes behind if the schedule itself failed.
+        if (spooling && files.length) await dropPending(name).catch(() => {});
+        throw e;
+      }
       return text(`Scheduled ✓ — sends at ${when.toISOString()}\nid: ${name}\n\n${preview}`);
     }
   );
@@ -412,7 +424,76 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
     async ({ id }) => {
       if (!schedulingOn()) return text("Scheduling isn't configured on this server.");
       await scheduler().send(new DeleteScheduleCommand({ Name: id, GroupName: SCHED.group }));
-      return text(`Canceled ${id}`);
+      // Drop any spooled attachments too; the lifecycle rule is only a backstop.
+      let dropped = 0;
+      if (storageOn()) dropped = await dropPending(id).catch(() => 0);
+      return text(`Canceled ${id}${dropped ? ` (and removed ${dropped} spooled attachment${dropped === 1 ? "" : "s"})` : ""}`);
+    }
+  );
+
+  // ---- named assets: upload once, attach by name forever ----
+  server.registerTool(
+    "list_assets",
+    {
+      title: "List saved attachments",
+      description:
+        "List files saved on the server that can be attached by name (e.g. a pricing sheet). Use the name with an attachment's `asset` field.",
+      inputSchema: {},
+    },
+    async () => {
+      if (!storageOn()) return text("Asset storage isn't configured on this server.");
+      const rows = await listAssets();
+      if (!rows.length) return text("(no saved assets yet)");
+      return text(
+        rows
+          .map((a) => `• ${a.name} — ${a.filename} (${a.contentType || "application/octet-stream"}, ${human(a.bytes)}, updated ${a.updated?.toISOString?.().slice(0, 10)})`)
+          .join("\n")
+      );
+    }
+  );
+
+  server.registerTool(
+    "save_asset",
+    {
+      title: "Save an attachment for reuse",
+      description:
+        "Save a file under a short name so later sends can attach it with `asset` instead of re-uploading. Re-saving the same name replaces it, and every future send picks up the new version.",
+      inputSchema: {
+        name: z.string().describe("Short slug to reference it by, e.g. pricing-sheet"),
+        path: z.string().optional().describe("Absolute path to a local file. Only works when this server runs locally over stdio."),
+        content_base64: z.string().optional().describe("The file's bytes, base64-encoded. Keep it small — this travels inside the tool call."),
+        filename: z.string().optional().describe("Filename recipients see; defaults to the source's own name."),
+        content_type: z.string().optional(),
+      },
+    },
+    async ({ name, path, content_base64, filename, content_type }) => {
+      if (!storageOn()) return text("Asset storage isn't configured on this server.");
+      // Reuse the attachment resolver so `path` gating and size limits behave
+      // identically to sending, rather than growing a second set of rules.
+      const [file] = await resolveAttachments([{ path, content_base64, filename, content_type }], {
+        allowLocalFiles,
+        withImap,
+      });
+      const saved = await putAsset(name, {
+        content: file.content,
+        filename: filename || file.filename,
+        contentType: file.contentType || undefined,
+      });
+      return text(`Saved asset "${saved.name}" — ${saved.filename} (${human(saved.bytes)})\n\nAttach it with: { "asset": "${saved.name}" }`);
+    }
+  );
+
+  server.registerTool(
+    "delete_asset",
+    {
+      title: "Delete a saved attachment",
+      description: "Remove a saved asset by name. Sends already scheduled keep their own copy and are unaffected.",
+      inputSchema: { name: z.string() },
+    },
+    async ({ name }) => {
+      if (!storageOn()) return text("Asset storage isn't configured on this server.");
+      await deleteAsset(name);
+      return text(`Deleted asset "${name}"`);
     }
   );
 
