@@ -24,13 +24,17 @@ is inherent to passing bytes through a tool call. If it ever matters, the answer
 is a presigned S3 PUT URL the user uploads to directly, with the resulting key
 usable as an attachment source. The bucket and IAM for it already exist.
 
-## 3. Untested against a live mailbox
+## ~~3. Untested against a live mailbox~~ — done
 
-- `send_email` with `content_base64` — **verified** 2026-08-04 (CSV round trip)
-- `read_message` attachment listing — **verified** 2026-08-04
-- `get_attachment` — **verified** 2026-08-04, bytes identical
-- `from_uid` forwarding — still unexercised; `uid 22` in `Sent` has an
-  attachment to test against
+Every attachment source is now verified against the live deployment:
+
+- `content_base64` on `send_email` — 2026-08-04, CSV round trip
+- `read_message` attachment listing — 2026-08-04
+- `get_attachment` — 2026-08-04, bytes identical to what was sent
+- `asset` on `schedule_send` — 2026-08-04, 391 KB PDF delivered by the worker
+- `from_uid` forwarding and `asset` on an immediate `send_email` — 2026-08-08,
+  both in one message; the forwarded CSV decoded byte-identical out of the
+  delivered mail
 
 ## 4. Asset storage is remote-only
 
