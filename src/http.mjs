@@ -61,15 +61,45 @@ export function startHttp() {
 
   const transports = {}; // sessionId -> transport
 
-  // Resolve { cfg, bearer, source } for a request, or null (→ 404).
+  // Resolve a request to { ok: true, ctx } or { ok: false, status, code, message }.
+  //
+  // The failure cases are kept distinct on purpose. Collapsing them all into
+  // "Unknown mailbox profile" sent someone debugging in the wrong direction:
+  // a URL missing its profile segment, a genuinely unknown profile, and
+  // Secrets Manager being unreachable are three different problems, and only
+  // the middle one is the client's fault.
   async function resolve(req) {
-    if (!multi) return single;
+    if (!multi) return { ok: true, ctx: single };
+
     const profile = profileFromPath(req.url);
-    if (!profile) return null;
+    if (!profile) {
+      return {
+        ok: false,
+        status: 404,
+        code: -32004,
+        message:
+          "This URL is missing its mailbox profile. The connector URL is https://<host>/<profile> — e.g. /dva — not /mcp.",
+      };
+    }
+
     try {
-      return await getProfile(profile);
-    } catch {
-      return null;
+      return { ok: true, ctx: await getProfile(profile) };
+    } catch (e) {
+      const missing = e?.name === "ResourceNotFoundException" || e?.message === "invalid profile";
+      if (missing) {
+        // Deliberately does not enumerate the valid profiles: this endpoint is
+        // unauthenticated and gets swept by scanners looking for exactly that.
+        return { ok: false, status: 404, code: -32004, message: `No mailbox profile named "${profile}".` };
+      }
+      // Anything else -- throttling, IAM, a network blip -- is our problem, not
+      // a bad URL, and must not masquerade as one.
+      console.log(`profile "${profile}" lookup FAILED: ${e?.name || "Error"}: ${e?.message || e}`);
+      return {
+        ok: false,
+        status: 503,
+        code: -32003,
+        message: "Mailbox configuration is temporarily unavailable. Retry shortly.",
+      };
     }
   }
 
@@ -117,8 +147,9 @@ export function startHttp() {
       }
     }
 
-    const ctx = await resolve(req);
-    if (!ctx) return jsonErr(res, 404, -32004, "Unknown mailbox profile.");
+    const resolved = await resolve(req);
+    if (!resolved.ok) return jsonErr(res, resolved.status, resolved.code, resolved.message);
+    const ctx = resolved.ctx;
 
     // Bearer auth (per-profile in multi-tenant mode). The 401 carries a
     // WWW-Authenticate pointing at this profile's protected-resource metadata,
