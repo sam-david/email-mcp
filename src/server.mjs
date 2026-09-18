@@ -242,16 +242,38 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
       title: "Search messages",
       description: "Search a mailbox by keyword across from / subject / body.",
       inputSchema: {
-        query: z.string().describe("Keyword to search for"),
+        query: z.string().optional().describe("Keyword across from / subject / body. Omit to filter only by the fields below."),
+        from: z.string().optional().describe("Match the sender specifically"),
+        subject: z.string().optional().describe("Match the subject specifically"),
+        since: z.string().optional().describe("Only messages on or after this date (YYYY-MM-DD)"),
+        before: z.string().optional().describe("Only messages before this date (YYYY-MM-DD)"),
+        unseen_only: z.boolean().optional().describe("Only unread messages"),
         mailbox: z.string().optional().describe("Mailbox, default INBOX"),
         limit: z.number().int().min(1).max(100).optional(),
       },
     },
-    async ({ query, mailbox = "INBOX", limit = 20 }) =>
+    async ({ query, from, subject, since, before, unseen_only, mailbox = "INBOX", limit = 20 }) =>
       withImap(async (c) => {
         await c.mailboxOpen(mailbox, { readOnly: true });
-        const uids = await c.search({ or: [{ from: query }, { subject: query }, { body: query }] }, { uid: true });
-        if (!uids || !uids.length) return text(`(no matches for "${query}")`);
+        // Criteria AND together; the free-text `query` stays an OR across the
+        // three fields it always searched, so existing callers behave the same.
+        const criteria = {};
+        if (query) criteria.or = [{ from: query }, { subject: query }, { body: query }];
+        if (from) criteria.from = from;
+        if (subject) criteria.subject = subject;
+        if (unseen_only) criteria.seen = false;
+        for (const [key, val] of [["since", since], ["before", before]]) {
+          if (!val) continue;
+          const d = new Date(val);
+          if (isNaN(d.getTime())) return text(`Invalid ${key} date "${val}". Use YYYY-MM-DD.`);
+          criteria[key] = d;
+        }
+        if (!Object.keys(criteria).length) {
+          return text("Give at least one of: query, from, subject, since, before, unseen_only.");
+        }
+        const described = JSON.stringify({ query, from, subject, since, before, unseen_only }, (k, v) => (v === undefined ? undefined : v));
+        const uids = await c.search(criteria, { uid: true });
+        if (!uids || !uids.length) return text(`(no matches for ${described})`);
         const rows = [];
         for await (const msg of c.fetch(uids.slice(-limit), { envelope: true, uid: true }, { uid: true })) {
           const when = msg.envelope?.date ? new Date(msg.envelope.date).toLocaleDateString() : "?";
@@ -356,6 +378,199 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
         .join("\n");
       return text(`Draft saved to "${box}" (${human(mime.length)}) — edit and send it from your mail client.\n\n${preview}`);
     }
+  );
+
+  server.registerTool(
+    "delete_message",
+    {
+      title: "Delete a message",
+      description:
+        "Move one message to Trash, where it stays recoverable. Set permanent: true to erase it immediately instead, which cannot be undone. Deletes exactly one message by UID — there is deliberately no bulk or search-based delete.",
+      inputSchema: {
+        uid: z.number().int().describe("Message UID, from list_messages / search_messages"),
+        mailbox: z.string().optional().describe("Mailbox holding the message, default INBOX"),
+        permanent: z
+          .boolean()
+          .optional()
+          .describe("Erase immediately rather than moving to Trash. Irreversible — leave unset unless the user explicitly asked to erase it for good."),
+      },
+    },
+    async ({ uid, mailbox = "INBOX", permanent = false }) =>
+      withImap(async (c) => {
+        // Writable: a move or an expunge cannot happen in a read-only mailbox.
+        await c.mailboxOpen(mailbox, { readOnly: false });
+
+        // Identify it BEFORE removing it, so the result says what was deleted
+        // rather than just a bare uid. This is the only record left afterwards.
+        const msg = await c.fetchOne(uid, { envelope: true }, { uid: true });
+        if (!msg) return text(`(no message with uid ${uid} in ${mailbox})`);
+        const when = msg.envelope?.date ? new Date(msg.envelope.date).toLocaleString() : "?";
+        const label = `${senderName(msg.envelope)} — ${msg.envelope?.subject || "(no subject)"} (${when})`;
+
+        if (permanent) {
+          await c.messageDelete(uid, { uid: true });
+          return text(`Permanently erased from ${mailbox}:\n  ${label}\n\nThis cannot be undone.`);
+        }
+
+        // Locate Trash by its IMAP special-use flag rather than assuming a name.
+        const boxes = await c.list();
+        const trash =
+          boxes.find((b) => b.specialUse === "\\Trash")?.path ||
+          boxes.find((b) => /^(trash|deleted items)$/i.test(b.name))?.path ||
+          "Trash";
+
+        if (trash === mailbox) {
+          return text(
+            `uid ${uid} is already in ${mailbox}:\n  ${label}\n\nMoving it to Trash would be a no-op. Pass permanent: true to erase it for good.`
+          );
+        }
+
+        await c.messageMove(uid, trash, { uid: true });
+        return text(`Moved to ${trash}:\n  ${label}\n\nStill recoverable from Trash.`);
+      })
+  );
+
+  server.registerTool(
+    "reply_message",
+    {
+      title: "Reply to a message",
+      description:
+        "Reply to a message by UID, keeping it in the same conversation. Sets the In-Reply-To and References headers so the reply threads correctly in the recipient's client — send_email does not, and starts a new thread instead. Honors dry-run.",
+      inputSchema: {
+        uid: z.number().int().describe("UID of the message being replied to"),
+        body: z.string().describe("Plain-text reply body"),
+        mailbox: z.string().optional().describe("Mailbox holding it, default INBOX"),
+        reply_all: z.boolean().optional().describe("Also copy the original To/Cc recipients (minus this mailbox)"),
+        quote: z.boolean().optional().describe("Append the quoted original below the reply, default true"),
+        html: z.string().optional(),
+        attachments: z.array(attachmentSchema).optional(),
+      },
+    },
+    async ({ uid, body, mailbox = "INBOX", reply_all = false, quote = true, html, attachments }) => {
+      assertCreds();
+      const files = await resolveAttachments(attachments, { allowLocalFiles, withImap });
+
+      const orig = await withImap(async (c) => {
+        await c.mailboxOpen(mailbox, { readOnly: true });
+        const msg = await c.fetchOne(uid, { source: true }, { uid: true });
+        if (!msg || !msg.source) throw new Error(`no message with uid ${uid} in ${mailbox}`);
+        return simpleParser(msg.source);
+      });
+
+      // Reply-To wins over From when the sender asked for it.
+      const target = orig.replyTo?.value?.[0]?.address || orig.from?.value?.[0]?.address;
+      if (!target) return text(`Could not determine a reply address for uid ${uid}.`);
+
+      const mine = new Set([cfg.email, cfg.fromAddress].filter(Boolean).map((a) => a.toLowerCase()));
+      const cc = reply_all
+        ? [...(orig.to?.value || []), ...(orig.cc?.value || [])]
+            .map((a) => a.address)
+            .filter((a) => a && !mine.has(a.toLowerCase()) && a.toLowerCase() !== target.toLowerCase())
+            .join(", ")
+        : undefined;
+
+      const subject = /^re:/i.test(orig.subject || "") ? orig.subject : `Re: ${orig.subject || "(no subject)"}`;
+
+      // References is the full chain plus the message being answered; In-Reply-To
+      // is just that message. Clients thread on both.
+      const priorRefs = orig.references
+        ? Array.isArray(orig.references) ? orig.references : [orig.references]
+        : [];
+      const references = [...priorRefs, orig.messageId].filter(Boolean);
+
+      let finalBody = body;
+      if (quote && orig.text) {
+        const when = orig.date ? orig.date.toLocaleString() : "an earlier message";
+        const who = orig.from?.text || target;
+        finalBody += `\n\nOn ${when}, ${who} wrote:\n` + orig.text.trim().split("\n").map((l) => `> ${l}`).join("\n");
+      }
+
+      const from = cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
+      const preview = [
+        `From: ${from}`,
+        `To: ${target}`,
+        cc ? `Cc: ${cc}` : null,
+        `Subject: ${subject}`,
+        `In-Reply-To: ${orig.messageId || "(none)"}`,
+        files.length ? `Attachments (${files.length}):\n${describeAttachments(files)}` : null,
+        "",
+        finalBody,
+      ].filter((l) => l !== null).join("\n");
+
+      if (cfg.dryRun) return text(`DRY RUN — not sent. Set MAIL_DRY_RUN=false to send for real.\n\n${preview}`);
+      const info = await sendMail(cfg, {
+        to: target, cc, subject, body: finalBody, html,
+        attachments: files, inReplyTo: orig.messageId, references,
+      });
+      return text(`Replied ✓ (${info.messageId})\n\n${preview}`);
+    }
+  );
+
+  server.registerTool(
+    "list_folders",
+    {
+      title: "List mailboxes",
+      description:
+        "List the folders in this account, with the special-use role of each (Inbox, Sent, Drafts, Trash, Archive, Junk). Every other tool takes a mailbox name — this is how to find out what those names are.",
+      inputSchema: {},
+    },
+    async () =>
+      withImap(async (c) => {
+        const boxes = await c.list();
+        if (!boxes.length) return text("(no folders)");
+        return text(
+          boxes
+            .map((b) => `${b.path}${b.specialUse ? `  [${b.specialUse.replace(/^\\/, "")}]` : ""}`)
+            .join("\n")
+        );
+      })
+  );
+
+  server.registerTool(
+    "mark_message",
+    {
+      title: "Mark a message",
+      description: "Mark a message read, unread, flagged or unflagged.",
+      inputSchema: {
+        uid: z.number().int(),
+        mailbox: z.string().optional().describe("Mailbox, default INBOX"),
+        as: z.enum(["read", "unread", "flagged", "unflagged"]).describe("What to change it to"),
+      },
+    },
+    async ({ uid, mailbox = "INBOX", as }) =>
+      withImap(async (c) => {
+        await c.mailboxOpen(mailbox, { readOnly: false });
+        const flag = as === "read" || as === "unread" ? "\\Seen" : "\\Flagged";
+        const add = as === "read" || as === "flagged";
+        const ok = add
+          ? await c.messageFlagsAdd(uid, [flag], { uid: true })
+          : await c.messageFlagsRemove(uid, [flag], { uid: true });
+        return text(ok ? `uid ${uid} marked ${as}.` : `(no message with uid ${uid} in ${mailbox})`);
+      })
+  );
+
+  server.registerTool(
+    "move_message",
+    {
+      title: "Move a message",
+      description:
+        "Move a message to another folder — archiving, filing, or restoring from Trash. Use list_folders for valid destinations. To delete, use delete_message instead.",
+      inputSchema: {
+        uid: z.number().int(),
+        to_mailbox: z.string().describe("Destination folder, e.g. Archive"),
+        mailbox: z.string().optional().describe("Source folder, default INBOX"),
+      },
+    },
+    async ({ uid, to_mailbox, mailbox = "INBOX" }) =>
+      withImap(async (c) => {
+        await c.mailboxOpen(mailbox, { readOnly: false });
+        const msg = await c.fetchOne(uid, { envelope: true }, { uid: true });
+        if (!msg) return text(`(no message with uid ${uid} in ${mailbox})`);
+        await c.messageMove(uid, to_mailbox, { uid: true });
+        return text(
+          `Moved to ${to_mailbox}:\n  ${senderName(msg.envelope)} — ${msg.envelope?.subject || "(no subject)"}`
+        );
+      })
   );
 
   // ---- scheduled send: EventBridge Scheduler → send-worker Lambda ----

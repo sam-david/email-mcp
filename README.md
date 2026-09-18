@@ -21,11 +21,30 @@ touches the mailbox.
 | `check_connection` | Verify IMAP login + SMTP readiness (no send); reports the active config source |
 | `list_messages` | Recent messages in a mailbox (from/subject/date/uid) |
 | `read_message` | Full text of one message by UID, plus any attachments it carries |
-| `search_messages` | Keyword search across from/subject/body |
+| `search_messages` | Search by keyword, sender, subject, date range or unread |
+| `list_folders` | List mailboxes and their roles (Inbox/Sent/Drafts/Trash/Archive/Junk) |
+| `reply_message` | Reply in-thread, with correct In-Reply-To / References |
+| `mark_message` | Mark read, unread, flagged or unflagged |
+| `move_message` | Move to another folder (archive, file, restore from Trash) |
+| `delete_message` | Move to Trash, or erase permanently with an explicit flag |
 | `get_attachment` | Download one attachment from a message |
 | `save_draft` | Write an email into the mailbox's Drafts folder instead of sending |
 | `send_email` | Send mail, with attachments (respects dry-run) |
 | `schedule_send` · `list_scheduled` · `cancel_scheduled` | Server-side scheduled sending (remote deployment only) |
+
+### Replying
+
+`send_email` always starts a **new thread**. To answer an existing message use
+`reply_message`, which sets `In-Reply-To` and `References` from the original so
+the reply threads properly in the recipient's client, prefixes `Re:`, quotes the
+original, and can copy the other recipients with `reply_all`.
+
+### Deleting
+
+`delete_message` moves a message to Trash, found by its IMAP special-use flag.
+It erases permanently only with an explicit `permanent: true`, and deletes
+exactly one message by UID — there is deliberately no bulk or search-based
+delete.
 
 ### Drafts
 
