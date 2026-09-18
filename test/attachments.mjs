@@ -175,6 +175,27 @@ check("a small scheduled attachment is allowed", underBudget.length === 1);
   );
 }
 
+// ---- buildMime: what save_draft appends to the Drafts folder ----
+// A draft must be byte-identical to what a send would produce, so it is
+// composed through the same path rather than a second formatter.
+{
+  const { buildMime } = await import("../src/send.mjs");
+  const cfg = { fromName: "Two Hens", fromAddress: "hello@example.com" };
+  const mime = (await buildMime(cfg, {
+    to: "someone@example.com",
+    subject: "Draft subject",
+    body: "Draft body.",
+    attachments: await resolveAttachments([{ path: filePath }], { allowLocalFiles: true }),
+  })).toString();
+  // nodemailer re-encodes the address and only quotes a display name that
+  // needs it, so accept both forms rather than pinning the quoting.
+  check("draft MIME carries the alias From", /From: "?Two Hens"? <hello@example\.com>/.test(mime), mime.match(/From:.*/)?.[0]);
+  check("draft MIME carries the subject", /Subject: Draft subject/.test(mime));
+  check("draft MIME carries the body", mime.includes("Draft body."));
+  check("draft MIME carries attachments too", /filename="?report\.csv"?/.test(mime));
+  check("draft MIME has a Date header", /^Date: /m.test(mime), mime.match(/Date:.*/)?.[0]);
+}
+
 // ---- end-to-end through the real stdio server (dry-run, nothing is sent) ----
 async function callTool(name, args, env = {}) {
   const proc = spawn(process.execPath, [new URL("../src/index.mjs", import.meta.url).pathname], {

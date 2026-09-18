@@ -23,8 +23,20 @@ touches the mailbox.
 | `read_message` | Full text of one message by UID, plus any attachments it carries |
 | `search_messages` | Keyword search across from/subject/body |
 | `get_attachment` | Download one attachment from a message |
+| `save_draft` | Write an email into the mailbox's Drafts folder instead of sending |
 | `send_email` | Send mail, with attachments (respects dry-run) |
 | `schedule_send` · `list_scheduled` · `cancel_scheduled` | Server-side scheduled sending (remote deployment only) |
+
+### Drafts
+
+`save_draft` composes the message exactly as a send would — same From, alias
+handling and attachments — then IMAP-APPENDs it to the Drafts folder with the
+`\Draft` flag. It shows up in Zoho webmail or Apple Mail, where you edit and
+send it yourself. Nothing is sent, and dry-run does not apply, since saving a
+draft is never a send.
+
+The folder is found via its IMAP special-use flag rather than by guessing at the
+name, with `Drafts` as a fallback; pass `mailbox` to override.
 
 ### Attachments
 

@@ -13,7 +13,7 @@ import {
   DeleteScheduleCommand,
   ListSchedulesCommand,
 } from "@aws-sdk/client-scheduler";
-import { sendMail } from "./send.mjs";
+import { sendMail, buildMime } from "./send.mjs";
 import {
   resolveAttachments,
   describe as describeAttachments,
@@ -299,6 +299,62 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
       }
       const info = await sendMail(cfg, { to, subject, body, cc, bcc, html, attachments: files });
       return text(`Sent ✓ (${info.messageId})\n\n${preview}`);
+    }
+  );
+
+  server.registerTool(
+    "save_draft",
+    {
+      title: "Save a draft",
+      description:
+        "Write an email into the mailbox's Drafts folder instead of sending it. The draft appears in your normal mail client (Zoho webmail, Apple Mail) where you can edit it and send it yourself. Nothing is sent, and dry-run does not apply — saving a draft is never a send.",
+      inputSchema: {
+        to: z.string().optional().describe("Recipient address(es), comma-separated. Optional — a draft may be unaddressed."),
+        subject: z.string().optional(),
+        body: z.string().optional().describe("Plain-text body"),
+        cc: z.string().optional(),
+        bcc: z.string().optional(),
+        html: z.string().optional().describe("Optional HTML body"),
+        attachments: z.array(attachmentSchema).optional().describe("Files to attach"),
+        mailbox: z.string().optional().describe("Override the drafts folder; found automatically when omitted."),
+      },
+    },
+    async ({ to, subject, body, cc, bcc, html, attachments, mailbox }) => {
+      assertCreds();
+      const files = await resolveAttachments(attachments, { allowLocalFiles, withImap });
+      // Compose exactly what a real send would produce, so what you review in
+      // the mail client is what would go out.
+      const mime = await buildMime(cfg, { to, subject, body, cc, bcc, html, attachments: files });
+
+      const box = await withImap(async (c) => {
+        let target = mailbox;
+        if (!target) {
+          // Folder naming varies by provider, so prefer the IMAP special-use
+          // flag over guessing at "Drafts".
+          const boxes = await c.list();
+          target =
+            boxes.find((b) => b.specialUse === "\\Drafts")?.path ||
+            boxes.find((b) => /^drafts$/i.test(b.name))?.path ||
+            "Drafts";
+        }
+        await c.append(target, mime, ["\\Draft"]);
+        return target;
+      });
+
+      const from = cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
+      const preview = [
+        `From: ${from}`,
+        to ? `To: ${to}` : "To: (unaddressed)",
+        cc ? `Cc: ${cc}` : null,
+        bcc ? `Bcc: ${bcc}` : null,
+        `Subject: ${subject || "(no subject)"}`,
+        files.length ? `Attachments (${files.length}):\n${describeAttachments(files)}` : null,
+        "",
+        body || "(no body)",
+      ]
+        .filter((l) => l !== null)
+        .join("\n");
+      return text(`Draft saved to "${box}" (${human(mime.length)}) — edit and send it from your mail client.\n\n${preview}`);
     }
   );
 
