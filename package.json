@@ -10,9 +10,10 @@
   "scripts": {
     "start": "node src/index.mjs",
     "check": "node --check src/index.mjs",
-    "test": "node test/oauth-flow.mjs && node test/attachments.mjs",
+    "test": "node test/oauth-flow.mjs && node test/attachments.mjs && node test/session.mjs",
     "test:oauth": "node test/oauth-flow.mjs",
-    "test:attachments": "node test/attachments.mjs"
+    "test:attachments": "node test/attachments.mjs",
+    "test:session": "node test/session.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1103.0",

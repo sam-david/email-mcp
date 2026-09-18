@@ -166,28 +166,50 @@ export function startHttp() {
     }
 
     const sessionId = req.headers["mcp-session-id"];
+    // Sessions live in this process's memory, so every container replacement
+    // ends all of them. That is survivable ONLY if the client is told to start
+    // a new one, and the spec is specific about how (2025-06-18, Session
+    // Management 3-4): a request carrying a session id the server does not
+    // recognise MUST get 404, and on 404 the client MUST re-initialize.
+    // A missing header is the different, genuinely-malformed case and keeps
+    // 400 (Session Management 2).
+    //
+    // This previously answered 400 for both. Clients that retry initialize
+    // anyway recovered and the logs showed 400 -> initialize -> ok; clients
+    // that follow the spec saw a generic bad-request, never re-initialized,
+    // and stayed wedged on a dead session id until reconnected by hand.
+    const sessionKey = sessionId ? `${profile}:${sessionId}` : null;
+    const gone = () =>
+      jsonErr(res, 404, -32001, "Session expired or unknown; send a new initialize request without a session id.");
+
     try {
       if (req.method === "POST") {
         const body = await readJson(req);
-        let transport = sessionId ? transports[sessionId] : undefined;
+        let transport = sessionKey ? transports[sessionKey] : undefined;
         if (!transport && isInitializeRequest(body)) {
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (sid) => { transports[sid] = transport; },
+            // Key by profile too: a session opened against one mailbox must
+            // never resolve against another, even given a guessed id.
+            onsessioninitialized: (sid) => { transports[`${profile}:${sid}`] = transport; },
           });
           transport.onclose = () => {
-            if (transport.sessionId) delete transports[transport.sessionId];
+            if (transport.sessionId) delete transports[`${profile}:${transport.sessionId}`];
           };
           await createServer(ctx.cfg, ctx.source).connect(transport);
         } else if (!transport) {
-          return jsonErr(res, 400, -32000, "No valid session; send an initialize request first.");
+          return sessionId
+            ? gone()
+            : jsonErr(res, 400, -32000, "No session id; send an initialize request first.");
         }
         await transport.handleRequest(req, res, body);
         return;
       }
       if (req.method === "GET" || req.method === "DELETE") {
-        const transport = sessionId ? transports[sessionId] : undefined;
-        if (!transport) return jsonErr(res, 400, -32000, "Unknown or missing session id.");
+        const transport = sessionKey ? transports[sessionKey] : undefined;
+        if (!transport) {
+          return sessionId ? gone() : jsonErr(res, 400, -32000, "Missing session id.");
+        }
         await transport.handleRequest(req, res);
         return;
       }
