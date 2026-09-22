@@ -117,3 +117,42 @@ resource "aws_iam_role_policy" "instance_scheduler" {
   role   = aws_iam_role.instance.id
   policy = data.aws_iam_policy_document.instance_scheduler.json
 }
+
+# --- Dead-letter queue -------------------------------------------------------
+# ActionAfterCompletion = DELETE removes a schedule once it has finished trying,
+# whether or not delivery succeeded. Without somewhere to put the payload, a
+# failed send vanished completely: the queue emptied, list_scheduled showed
+# nothing, and "no pending schedules" was indistinguishable from "all sent".
+# Thirteen sends were lost that way on 2026-09-21.
+resource "aws_sqs_queue" "scheduler_dlq" {
+  name                      = "${var.service_name}-scheduled-send-dlq"
+  message_retention_seconds = 1209600 # 14 days
+  sqs_managed_sse_enabled   = true
+}
+
+data "aws_iam_policy_document" "scheduler_dlq" {
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.scheduler_dlq.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "scheduler_dlq" {
+  name   = "dlq-send"
+  role   = aws_iam_role.scheduler.id
+  policy = data.aws_iam_policy_document.scheduler_dlq.json
+}
+
+# The MCP server reads the queue depth so list_scheduled can report failures.
+data "aws_iam_policy_document" "server_dlq_read" {
+  statement {
+    actions   = ["sqs:GetQueueAttributes", "sqs:ReceiveMessage"]
+    resources = [aws_sqs_queue.scheduler_dlq.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "server_dlq_read" {
+  name   = "dlq-read"
+  role   = aws_iam_role.instance.id
+  policy = data.aws_iam_policy_document.server_dlq_read.json
+}

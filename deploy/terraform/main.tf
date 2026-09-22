@@ -140,6 +140,7 @@ resource "aws_apprunner_service" "app" {
           WORKER_LAMBDA_ARN  = aws_lambda_function.worker.arn
           SCHEDULER_ROLE_ARN = aws_iam_role.scheduler.arn
           SCHEDULER_GROUP    = aws_scheduler_schedule_group.email.name
+          SCHEDULER_DLQ_ARN  = aws_sqs_queue.scheduler_dlq.arn
           # OAuth metadata advertises absolute URLs; pin them to the custom
           # domain rather than inferring the scheme/host from proxy headers.
           PUBLIC_BASE_URL = "https://${var.domain_name}"

@@ -10,15 +10,17 @@
   "scripts": {
     "start": "node src/index.mjs",
     "check": "node --check src/index.mjs",
-    "test": "node test/oauth-flow.mjs && node test/attachments.mjs && node test/session.mjs",
+    "test": "node test/oauth-flow.mjs && node test/attachments.mjs && node test/session.mjs && node test/scheduling.mjs",
     "test:oauth": "node test/oauth-flow.mjs",
     "test:attachments": "node test/attachments.mjs",
-    "test:session": "node test/session.mjs"
+    "test:session": "node test/session.mjs",
+    "test:scheduling": "node test/scheduling.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1103.0",
     "@aws-sdk/client-scheduler": "^3.1097.0",
     "@aws-sdk/client-secrets-manager": "^3.1097.0",
+    "@aws-sdk/client-sqs": "^3.1138.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "imapflow": "^1.0.164",
     "mailparser": "^3.7.1",

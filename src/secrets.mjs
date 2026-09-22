@@ -9,7 +9,7 @@
 //
 // Local (no SECRETS_PREFIX): single-profile mode is used instead (see http.mjs);
 // this module is inert.
-import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import { SecretsManagerClient, GetSecretValueCommand, DescribeSecretCommand } from "@aws-sdk/client-secrets-manager";
 
 const PREFIX = process.env.SECRETS_PREFIX || "";
 const client = PREFIX ? new SecretsManagerClient({}) : null;
@@ -53,4 +53,24 @@ export async function getProfile(profile) {
   const value = { ...parsed, source: `secretsmanager:${secretId}` };
   cache.set(profile, { value, expires: now + TTL_MS });
   return value;
+}
+
+// The prefix the WORKER will use when it fires. Locally SECRETS_PREFIX is unset
+// (this module is otherwise inert), but a scheduled send is executed in the
+// cloud, so the name it will look up is still email-mcp/<profile>.
+export const workerSecretId = (profile) => `${PREFIX || "email-mcp/"}${profile}`;
+
+// Does the secret a scheduled send will need actually exist? Checked before
+// queueing, because the failure otherwise happens hours later inside a Lambda
+// where the caller never sees it. DescribeSecret, not GetSecretValue: we only
+// need existence, not the credentials.
+export async function secretResolves(profile) {
+  const SecretId = workerSecretId(profile);
+  const c = client || new SecretsManagerClient({});
+  try {
+    await c.send(new DescribeSecretCommand({ SecretId }));
+    return { ok: true, SecretId };
+  } catch (e) {
+    return { ok: false, SecretId, reason: e?.name || String(e?.message || e) };
+  }
 }

@@ -23,6 +23,7 @@ import {
   MAX_SCHEDULED_TOTAL,
 } from "./attachments.mjs";
 import { storageOn, listAssets, putAsset, deleteAsset, spoolPending, dropPending } from "./storage.mjs";
+import { secretResolves, workerSecretId } from "./secrets.mjs";
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const senderName = (env) =>
@@ -580,12 +581,50 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
     workerArn: process.env.WORKER_LAMBDA_ARN,
     roleArn: process.env.SCHEDULER_ROLE_ARN,
     group: process.env.SCHEDULER_GROUP || "default",
+    dlqArn: process.env.SCHEDULER_DLQ_ARN,
   };
   const schedulingOn = () => Boolean(SCHED.workerArn && SCHED.roleArn);
+  // Which mailbox the WORKER will load when a scheduled send fires. This must
+  // name a real Secrets Manager secret, so guessing is not acceptable: a wrong
+  // value produces a schedule that cannot possibly succeed, and the failure
+  // surfaces hours later in a Lambda the caller never sees.
+  //
+  // This used to fall back to "default" when it could not tell. In cloud mode
+  // the ARN always matches, so that path never ran there -- but every local
+  // stdio schedule was queued as "default", asked for a secret that has never
+  // existed, and died silently. Returning null instead forces the caller to
+  // refuse the request up front.
   const profileName = () => {
-    const m = /secretsmanager:.*\/([^/]+)$/.exec(source);
-    return m ? m[1] : process.env.MAIL_PROFILE || "default";
+    const m = /secretsmanager:.*\/([^/]+)$/.exec(source); // cloud: secretsmanager:email-mcp/dva
+    if (m) return m[1];
+    if (process.env.MAIL_PROFILE) return process.env.MAIL_PROFILE;
+    // local: ~/.config/email-mcp/two-hens.env -> two-hens
+    const f = /([^/\\]+)\.env$/.exec(process.env.MAIL_ENV_FILE || "");
+    return f ? f[1] : null;
   };
+
+  // Refuse to queue anything that cannot succeed. Returns an error string, or
+  // null when the profile is good.
+  async function schedulingBlocker() {
+    const profile = profileName();
+    if (!profile) {
+      return (
+        "Cannot tell which mailbox a scheduled send should use.\n\n" +
+        `Config source is "${source}", which does not name a profile. Set MAIL_PROFILE ` +
+        "(or point MAIL_ENV_FILE at <profile>.env) so the send worker knows which " +
+        "credentials to load, then restart the server — the environment is read at startup."
+      );
+    }
+    const check = await secretResolves(profile);
+    if (!check.ok) {
+      return (
+        `Refusing to schedule: the send worker would look up "${check.SecretId}", which is not readable (${check.reason}).\n\n` +
+        "A schedule queued against a missing secret fails silently hours later. " +
+        "Check the profile name, or create that secret first."
+      );
+    }
+    return null;
+  }
   const scheduler = () => new SchedulerClient({});
 
   server.registerTool(
@@ -610,6 +649,8 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
     },
     async ({ to, subject, body, send_at, cc, bcc, html, attachments }) => {
       if (!schedulingOn()) return text("Scheduling isn't configured on this server (no worker Lambda / role).");
+      const blocker = await schedulingBlocker();
+      if (blocker) return text(blocker);
       const when = new Date(send_at);
       if (isNaN(when.getTime())) return text(`Invalid send_at "${send_at}". Use ISO 8601, e.g. 2026-08-01T14:30:00Z.`);
       if (when.getTime() <= Date.now() + 60_000) return text("send_at must be at least a minute in the future.");
@@ -655,10 +696,15 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
             ScheduleExpression: `at(${when.toISOString().slice(0, 19)})`, // yyyy-mm-ddThh:mm:ss
             ScheduleExpressionTimezone: "UTC",
             FlexibleTimeWindow: { Mode: "OFF" },
-            ActionAfterCompletion: "DELETE", // self-clean after it fires
+            // The schedule is removed once it has finished attempting delivery,
+            // successfully or not -- so the payload has to survive somewhere
+            // else. That is what the dead-letter queue is for.
+            ActionAfterCompletion: "DELETE",
             Target: {
               Arn: SCHED.workerArn,
               RoleArn: SCHED.roleArn,
+              RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 3600 },
+              ...(SCHED.dlqArn ? { DeadLetterConfig: { Arn: SCHED.dlqArn } } : {}),
               Input: JSON.stringify({ profile: profileName(), to, subject, body, cc, bcc, html, ...payloadAttachments }),
             },
           })
@@ -677,11 +723,44 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
     { title: "List scheduled sends", description: "List pending scheduled emails for this mailbox.", inputSchema: {} },
     async () => {
       if (!schedulingOn()) return text("Scheduling isn't configured on this server.");
-      const out = await scheduler().send(
-        new ListSchedulesCommand({ GroupName: SCHED.group, NamePrefix: `emailmcp-${profileName()}-` })
-      );
-      const names = (out.Schedules || []).map((s) => s.Name);
-      return text(names.length ? names.join("\n") : "(no scheduled sends)");
+      const profile = profileName();
+      const lines = [];
+
+      if (profile) {
+        const out = await scheduler().send(
+          new ListSchedulesCommand({ GroupName: SCHED.group, NamePrefix: `emailmcp-${profile}-` })
+        );
+        const names = (out.Schedules || []).map((s) => s.Name);
+        lines.push(names.length ? `PENDING (${names.length}):\n` + names.map((n) => `  ${n}`).join("\n") : "PENDING: none");
+      } else {
+        lines.push("PENDING: unknown — this server cannot determine its mailbox profile (see schedule_send).");
+      }
+
+      // A delivered send leaves no schedule behind, so "not pending" is
+      // ambiguous on its own. The dead-letter queue is what distinguishes
+      // "already sent" from "died trying".
+      if (SCHED.dlqArn) {
+        try {
+          const { SQSClient, GetQueueAttributesCommand } = await import("@aws-sdk/client-sqs");
+          const url = `https://sqs.${process.env.AWS_REGION || "us-east-1"}.amazonaws.com/${SCHED.dlqArn.split(":")[4]}/${SCHED.dlqArn.split(":")[5]}`;
+          const attrs = await new SQSClient({}).send(
+            new GetQueueAttributesCommand({ QueueUrl: url, AttributeNames: ["ApproximateNumberOfMessages"] })
+          );
+          const dead = Number(attrs.Attributes?.ApproximateNumberOfMessages || 0);
+          lines.push(
+            dead
+              ? `FAILED: ${dead} send(s) in the dead-letter queue — they did NOT go out. Inspect with:\n  aws sqs receive-message --queue-url ${url} --max-number-of-messages 10`
+              : "FAILED: none"
+          );
+        } catch (e) {
+          lines.push(`FAILED: could not read the dead-letter queue (${e?.name || e})`);
+        }
+      } else {
+        lines.push("FAILED: not tracked — no dead-letter queue configured on this deployment.");
+      }
+
+      lines.push("\nNote: a delivered send removes its own schedule, so it appears in neither list.");
+      return text(lines.join("\n"));
     }
   );
 
