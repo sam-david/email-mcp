@@ -7,6 +7,7 @@ import { z } from "zod";
 import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import { simpleParser } from "mailparser";
+import mimeTypes from "nodemailer/lib/mime-funcs/mime-types.js";
 import {
   SchedulerClient,
   CreateScheduleCommand,
@@ -26,6 +27,18 @@ import { storageOn, listAssets, putAsset, deleteAsset, spoolPending, dropPending
 import { secretResolves, workerSecretId } from "./secrets.mjs";
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
+// MCP content blocks are not all text. An image returned as an image block is
+// actually seen by the model; the same bytes as base64 text are not.
+const imageBlock = (caption, data, mimeType) => ({
+  content: [{ type: "text", text: caption }, { type: "image", data, mimeType }],
+});
+
+// Types whose bytes are meaningful as text. Decoding these is the difference
+// between the model reading an attachment and being handed base64 it cannot
+// reliably decode.
+const TEXTUAL = /^(text\/|application\/(json|xml|csv|x-ndjson|javascript)|application\/[\w.+-]*\+(json|xml))/i;
+const MAX_INLINE_TEXT = 256 * 1024; // keep a huge CSV from swamping the context
+const MAX_INLINE_IMAGE = 5 * 1024 * 1024;
 const senderName = (env) =>
   env?.from?.[0] ? (env.from[0].name || env.from[0].address) : "(unknown)";
 
@@ -178,7 +191,10 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
           `Subject: ${p.subject || "(no subject)"}`,
           // Surface attachments by name — otherwise the message reads as if it
           // had none, and they can be forwarded via send_email's from_uid.
-          files.length ? `Attachments (${files.length}):\n${describeAttachments(files)}` : null,
+          files.length
+            ? `Attachments (${files.length}):\n${describeAttachments(files)}\n` +
+              `  (get_attachment returns text and images directly; other types come back as opaque bytes)`
+            : null,
         ]
           .filter((l) => l !== null)
           .join("\n");
@@ -227,12 +243,38 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
         return text(`Saved ${picked.filename} (${human(picked.content.length)}) to ${save_to}`);
       }
 
-      if (picked.content.length > MAX_ONE) {
-        return text(`${picked.filename} is ${human(picked.content.length)} — too large to return inline (limit ${human(MAX_ONE)}).`);
+      const ct = picked.contentType || mimeTypes.detectMimeType(picked.filename || "") || "application/octet-stream";
+      const size = picked.content.length;
+      const head = `${picked.filename} (${ct}, ${human(size)})`;
+
+      // Images come back as an image block so they can actually be looked at.
+      if (/^image\//i.test(ct)) {
+        if (size > MAX_INLINE_IMAGE) {
+          return text(`${head} — too large to return inline (limit ${human(MAX_INLINE_IMAGE)}). Use save_to on a local server.`);
+        }
+        return imageBlock(head, picked.content.toString("base64"), ct);
+      }
+
+      // Text-ish payloads are returned decoded, not base64-encoded.
+      if (TEXTUAL.test(ct)) {
+        const body = picked.content.subarray(0, MAX_INLINE_TEXT).toString("utf8");
+        const clipped = size > MAX_INLINE_TEXT ? `\n\n[truncated at ${human(MAX_INLINE_TEXT)} of ${human(size)}]` : "";
+        return text(`${head}:\n\n${body}${clipped}`);
+      }
+
+      // Anything else is opaque bytes. Say so plainly rather than returning
+      // base64 that cannot be understood -- a PDF or Office file handed over as
+      // base64 is not readable, just expensive.
+      const advice =
+        /pdf$/i.test(ct) || /\.(pdf|docx?|xlsx?|pptx?)$/i.test(picked.filename || "")
+          ? " Its text cannot be extracted by this server yet — save it and open it, or ask the sender for a text version."
+          : "";
+      if (size > MAX_ONE) {
+        return text(`${head} — too large to return inline (limit ${human(MAX_ONE)}).${advice}`);
       }
       return text(
-        `${picked.filename} (${picked.contentType || "application/octet-stream"}, ${human(picked.content.length)}), base64:\n\n` +
-          picked.content.toString("base64")
+        `${head} — binary, not readable as text.${advice}\n\n` +
+          `If you need the raw bytes, they are base64 below.\n\n${picked.content.toString("base64")}`
       );
     }
   );

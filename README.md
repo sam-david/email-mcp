@@ -27,10 +27,25 @@ touches the mailbox.
 | `mark_message` | Mark read, unread, flagged or unflagged |
 | `move_message` | Move to another folder (archive, file, restore from Trash) |
 | `delete_message` | Move to Trash, or erase permanently with an explicit flag |
-| `get_attachment` | Download one attachment from a message |
+| `get_attachment` | Read one attachment — text decoded, images as image blocks |
 | `save_draft` | Write an email into the mailbox's Drafts folder instead of sending |
 | `send_email` | Send mail, with attachments (respects dry-run) |
 | `schedule_send` · `list_scheduled` · `cancel_scheduled` | Server-side scheduled sending (remote deployment only) |
+
+### Reading attachments
+
+`get_attachment` returns what the model can actually use:
+
+| Attachment type | What comes back |
+|-----------------|-----------------|
+| `text/*`, JSON, CSV, XML | the decoded text, up to 256 KB |
+| images | an MCP `image` content block — genuinely seen, not base64 |
+| PDF, Office, other binaries | type and size, and a clear statement that the text cannot be extracted |
+
+Binary formats are reported honestly rather than returned as base64 the model
+cannot decode. PDF text extraction would need a parser running over untrusted
+email input, which is a deliberate dependency and attack-surface decision, not
+an oversight.
 
 ### Replying
 
