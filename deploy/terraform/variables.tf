@@ -33,3 +33,9 @@ variable "profiles" {
   type    = list(string)
   default = ["dva"]
 }
+
+variable "alert_email" {
+  description = "Address that receives scheduled-send failure alerts. AWS emails a confirmation link that must be clicked before any alert is delivered."
+  type        = string
+  default     = "sfd1987@gmail.com"
+}
