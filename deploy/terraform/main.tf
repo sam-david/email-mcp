@@ -88,7 +88,8 @@ resource "aws_iam_role" "instance" {
 # Read any email-mcp/* secret, so adding a profile needs no IAM change.
 data "aws_iam_policy_document" "read_secrets" {
   statement {
-    actions   = ["secretsmanager:GetSecretValue"]
+    # DescribeSecret lets schedule_send confirm a profile exists before queueing.
+    actions   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
     resources = ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.me.account_id}:secret:${var.service_name}/*"]
   }
 }

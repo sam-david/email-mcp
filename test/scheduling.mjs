@@ -52,5 +52,24 @@ check("nonexistent secret is refused", /refusing to schedule/i.test(badProfile),
 check("refusal names the secret the worker would need", /email-mcp\/definitely-not-a-real-profile/.test(badProfile));
 check("nothing was queued", !/Scheduled ✓/.test(badProfile));
 
+// 3. A check that cannot RUN must not block the send. Simulating the live
+// failure: the deployment's role grants GetSecretValue but not DescribeSecret,
+// so the guard got AccessDenied for a secret it reads fine on every request —
+// and refused every scheduled send. Only a genuine absence may block.
+{
+  const { secretResolves } = await import("../src/secrets.mjs");
+  const real = await secretResolves("definitely-not-a-real-profile");
+  check("a missing secret is reported missing", real.missing === true, JSON.stringify(real));
+
+  // Force a non-ResourceNotFound error by pointing at an unreachable endpoint.
+  const prevRegion = process.env.AWS_REGION;
+  process.env.AWS_ENDPOINT_URL_SECRETS_MANAGER = "http://127.0.0.1:1";
+  const mod = await import("../src/secrets.mjs?nocache=" + Date.now());
+  const unreachable = await mod.secretResolves("dva");
+  delete process.env.AWS_ENDPOINT_URL_SECRETS_MANAGER;
+  if (prevRegion) process.env.AWS_REGION = prevRegion;
+  check("an unverifiable check does NOT block", unreachable.ok === true && unreachable.unverified === true, JSON.stringify(unreachable).slice(0, 120));
+}
+
 console.log(failures ? `\n${failures} FAILURE(S)` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

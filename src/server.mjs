@@ -657,10 +657,15 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
         "credentials to load, then restart the server — the environment is read at startup."
       );
     }
+    // In cloud mode the profile was loaded FROM Secrets Manager to serve this
+    // very request, so its existence is already proven -- re-checking it can
+    // only introduce new ways to fail.
+    if (/^secretsmanager:/.test(source)) return null;
+
     const check = await secretResolves(profile);
-    if (!check.ok) {
+    if (check.missing) {
       return (
-        `Refusing to schedule: the send worker would look up "${check.SecretId}", which is not readable (${check.reason}).\n\n` +
+        `Refusing to schedule: the send worker will look up "${check.SecretId}", which does not exist.\n\n` +
         "A schedule queued against a missing secret fails silently hours later. " +
         "Check the profile name, or create that secret first."
       );

@@ -71,6 +71,15 @@ export async function secretResolves(profile) {
     await c.send(new DescribeSecretCommand({ SecretId }));
     return { ok: true, SecretId };
   } catch (e) {
-    return { ok: false, SecretId, reason: e?.name || String(e?.message || e) };
+    const name = e?.name || String(e?.message || e);
+    // ONLY a genuine absence is evidence the send cannot succeed. Anything
+    // else -- no DescribeSecret permission, throttling, a network blip --
+    // means the check could not run, which says nothing about the secret.
+    // Blocking on those turns a diagnostic into an outage: this refused every
+    // scheduled send on the live deployment, whose role grants GetSecretValue
+    // but not DescribeSecret, for a secret it reads successfully on every
+    // request.
+    if (name === "ResourceNotFoundException") return { ok: false, missing: true, SecretId, reason: name };
+    return { ok: true, unverified: true, SecretId, reason: name };
   }
 }
