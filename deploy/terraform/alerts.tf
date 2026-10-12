@@ -115,3 +115,18 @@ resource "aws_cloudwatch_metric_alarm" "no_deliveries" {
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
 }
+
+# Let the MCP server read alarm state, so health_check can report it and a
+# monitoring routine can act on something other than a human noticing.
+data "aws_iam_policy_document" "server_cloudwatch_read" {
+  statement {
+    actions   = ["cloudwatch:DescribeAlarms", "cloudwatch:GetMetricStatistics"]
+    resources = ["*"] # neither action supports resource-level permissions
+  }
+}
+
+resource "aws_iam_role_policy" "server_cloudwatch_read" {
+  name   = "cloudwatch-read"
+  role   = aws_iam_role.instance.id
+  policy = data.aws_iam_policy_document.server_cloudwatch_read.json
+}

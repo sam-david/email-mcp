@@ -17,6 +17,7 @@
     "test:scheduling": "node test/scheduling.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1149.0",
     "@aws-sdk/client-s3": "^3.1103.0",
     "@aws-sdk/client-scheduler": "^3.1097.0",
     "@aws-sdk/client-secrets-manager": "^3.1097.0",

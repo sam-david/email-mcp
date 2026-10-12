@@ -828,6 +828,56 @@ export function createServer(cfg, source = "process environment", { allowLocalFi
     }
   );
 
+  server.registerTool(
+    "health_check",
+    {
+      title: "Check scheduled-send health",
+      description:
+        "Report whether scheduled sending is currently healthy: CloudWatch alarm states, how many sends are sitting failed in the dead-letter queue, and when the last successful delivery was. Intended for a monitoring routine — call it on a schedule and act on anything not OK.",
+      inputSchema: {},
+    },
+    async () => {
+      const out = [];
+      try {
+        const { CloudWatchClient, DescribeAlarmsCommand, GetMetricStatisticsCommand } = await import("@aws-sdk/client-cloudwatch");
+        const cw = new CloudWatchClient({});
+        const alarms = await cw.send(new DescribeAlarmsCommand({ AlarmNamePrefix: "email-mcp-" }));
+        const rows = (alarms.MetricAlarms || []).map((a) => ({ name: a.AlarmName, state: a.StateValue, since: a.StateUpdatedTimestamp }));
+        if (!rows.length) out.push("ALARMS: none configured — nothing is watching scheduled sends.");
+        else {
+          const bad = rows.filter((r) => r.state === "ALARM");
+          out.push(bad.length ? `ALARMS: ${bad.length} IN ALARM` : "ALARMS: all OK");
+          for (const r of rows) out.push(`  ${r.state === "ALARM" ? "!!" : r.state === "OK" ? "ok" : "--"} ${r.name} (${r.state})`);
+        }
+
+        const since = new Date(Date.now() - 48 * 3600e3);
+        const m = await cw.send(new GetMetricStatisticsCommand({
+          Namespace: "email-mcp", MetricName: "ScheduledSendDelivered",
+          StartTime: since, EndTime: new Date(), Period: 3600, Statistics: ["Sum"],
+        }));
+        const pts = (m.Datapoints || []).filter((d) => d.Sum > 0).sort((a, b) => b.Timestamp - a.Timestamp);
+        out.push(pts.length
+          ? `LAST DELIVERY: ${pts[0].Timestamp.toISOString()} (${pts.reduce((n, d) => n + d.Sum, 0)} in the last 48h)`
+          : "LAST DELIVERY: none in the last 48h — the daily canary should produce one.");
+      } catch (e) {
+        out.push(`ALARMS: could not read CloudWatch (${e?.name || e})`);
+      }
+
+      if (SCHED.dlqArn) {
+        try {
+          const { SQSClient, GetQueueAttributesCommand } = await import("@aws-sdk/client-sqs");
+          const url = `https://sqs.${process.env.AWS_REGION || "us-east-1"}.amazonaws.com/${SCHED.dlqArn.split(":")[4]}/${SCHED.dlqArn.split(":")[5]}`;
+          const a = await new SQSClient({}).send(new GetQueueAttributesCommand({ QueueUrl: url, AttributeNames: ["ApproximateNumberOfMessages"] }));
+          const n = Number(a.Attributes?.ApproximateNumberOfMessages || 0);
+          out.push(n ? `FAILED SENDS: ${n} in the dead-letter queue — these did NOT go out.` : "FAILED SENDS: none");
+        } catch (e) {
+          out.push(`FAILED SENDS: could not read the queue (${e?.name || e})`);
+        }
+      }
+      return text(out.join("\n"));
+    }
+  );
+
   // ---- named assets: upload once, attach by name forever ----
   server.registerTool(
     "list_assets",
